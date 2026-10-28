@@ -176,59 +176,214 @@ export async function checkRaydiumLaunchSigning(
  return 'Raydium V0 transaction: BUILT ('+bytes+' bytes, '+n+' signers; '+built.transactions.length+' SDK transaction(s); SDK originally had '+sdkSignatures+' signature(s)). Simulation: PASSED. Unsigned Raydium message accepted by Phantom: PASSED. Local mint co-signature added afterward: PASSED. No transaction sent and no token created.';
 }
 
-export async function launchToken(connection:Connection,config:AppConfig,wallet:WalletContextState,input:{name:string;symbol:string;uri:string}){
- if(!wallet.publicKey||!wallet.signAllTransactions)throw new Error('Connect a wallet that supports transaction signing');
- if(!config.launchEnabled)throw new Error(config.launchBlockReason||'Token creation is currently disabled');
- const platformId=await requireLaunchPlatform(connection,config,wallet.publicKey);
- // ORBIT_STAGE6_SIGNING_PREFLIGHT: check wallet capability and test-SOL balance before constructing a transaction.
- const versionSupport=wallet.wallet?.adapter?.supportedTransactionVersions;
- if(versionSupport&&!versionSupport.has(0))throw new Error('The selected wallet cannot sign Solana version-0 transactions. Choose a wallet supporting version 0.');
- const balance=await connection.getBalance(wallet.publicKey,'confirmed');
- if(balance===0)throw new Error('This wallet has 0 SOL on Devnet. Fund it with test SOL, then retry. Do not use mainnet funds.');
+
+// ORBIT_STAGE10_VERIFIED_DEVNET_LAUNCH
+// Devnet only. No automatic retries or wallet-warning bypass.
+export async function launchToken(
+ connection:Connection,
+ config:AppConfig,
+ wallet:WalletContextState,
+ input:{name:string;symbol:string;uri:string}
+){
+ if(config.network!=='devnet')
+  throw new Error('Mainnet launches are disabled');
+
+ if(!config.launchEnabled)
+  throw new Error(config.launchBlockReason||'Launch unavailable');
+
+ if(!wallet.publicKey||!wallet.signTransaction)
+  throw new Error('Connect a V0-compatible Solana wallet');
+
+ const payer=wallet.publicKey;
+ const support=wallet.wallet?.adapter?.supportedTransactionVersions;
+
+ if(support&&!support.has(0))
+  throw new Error('Wallet does not support V0 transactions');
+
+ if(await connection.getBalance(payer,'confirmed')===0)
+  throw new Error('Wallet has no Devnet SOL');
+
+ const programId=program(config);
+ const platformId=await requireLaunchPlatform(
+  connection,config,payer
+ );
+
+ const {configId,configInfo}=await verifyLaunchConfig(
+  connection,config
+ );
+
  const raydium=await sdk(connection,config,wallet);
- const programId=program(config);const mint=Keypair.generate();
- const {configId,configInfo}=await verifyLaunchConfig(connection,config);
- const quoteInfo=await raydium.token.getTokenInfo(configInfo.mintB);
- const {execute,extInfo,transactions}=await raydium.launchpad.createLaunchpad({
-  programId,mintA:mint.publicKey,name:input.name,symbol:input.symbol,uri:input.uri,
-  decimals:6,migrateType:'cpmm',configId,configInfo,mintBDecimals:quoteInfo.decimals,
-  createOnly:true,buyAmount:new BN(1000),slippage:new BN(100),extraSigners:[mint],txVersion:TxVersion.V0,
+ const mint=Keypair.generate();
+ const quote=await raydium.token.getTokenInfo(configInfo.mintB);
+
+ const built=await raydium.launchpad.createLaunchpad({
+  programId,
+  mintA:mint.publicKey,
+  name:input.name,
+  symbol:input.symbol,
+  uri:input.uri,
+  decimals:6,
+  migrateType:'cpmm',
+  configId,
+  configInfo,
+  mintBDecimals:quote.decimals,
+  createOnly:true,
+  buyAmount:new BN(1000),
+  slippage:new BN(100),
+  extraSigners:[mint],
+  txVersion:TxVersion.V0,
   platformId
  } as any);
- // Simulate the FIRST transaction only: later transactions may depend on it being confirmed.
- // Preflight simulation is not a wallet signature and never broadcasts a transaction.
- if(!Array.isArray(transactions)||transactions.length===0)throw new Error('Raydium did not build any launch transactions.');
- const first=transactions[0];
- if(first instanceof VersionedTransaction){
-  const payer=first.message.staticAccountKeys[0];
-  if(!payer?.equals(wallet.publicKey))throw new Error('Launch transaction fee payer differs from your connected wallet. Signing blocked.');
-  let simulated;
-  try{
-   simulated=await connection.simulateTransaction(first,{sigVerify:false,replaceRecentBlockhash:true,commitment:'confirmed'});
-  }catch(e){
-   throw new Error(`Devnet transaction preflight RPC failed: ${e instanceof Error?e.message:String(e)}`,{cause:e});
-  }
-  if(simulated.value.err){
-   const logs=(simulated.value.logs||[]).slice(-12).join(' | ');
-   throw new Error(`Devnet launch simulation failed BEFORE wallet approval: ${JSON.stringify(simulated.value.err)}${logs?' | Program logs: '+logs:''}`);
-  }
+
+ if(!Array.isArray(built.transactions)||
+    built.transactions.length!==1)
+  throw new Error(
+   'Expected one Raydium transaction. Signing blocked.'
+  );
+
+ const original=built.transactions[0];
+
+ if(!(original instanceof VersionedTransaction)||
+    original.message.version!==0)
+  throw new Error('Unsupported Raydium transaction format');
+
+
+ const message=original.message;
+ // ORBIT_STAGE11_ALT_RESOLUTION
+ // Solana V0 Address Lookup Tables are valid. Resolve every referenced table
+ // on the same Devnet RPC, then validate programs using ALL resolved keys.
+ // Missing tables or program IDs not on the existing allowlist fail closed.
+ const lookupTables=await Promise.all(
+  message.addressTableLookups.map(async lookup=>{
+   const result=await connection.getAddressLookupTable(
+    lookup.accountKey,{commitment:'confirmed'}
+   );
+   if(!result.value)
+    throw new Error('Missing Devnet address lookup table: '+lookup.accountKey.toBase58());
+   return result.value;
+  })
+ );
+ const resolvedKeys=message.getAccountKeys({addressLookupTableAccounts:lookupTables});
+ for(const ix of message.compiledInstructions){
+  if(!resolvedKeys.get(ix.programIdIndex) ||
+     ix.accountKeyIndexes.some(i=>!resolvedKeys.get(i)))
+   throw new Error('Unresolved Devnet transaction account index; launch blocked');
  }
- let txIds:string[];
- try{
-  ({txIds}=await execute({sequentially:true}));
- }catch(e){
-  const error=e as any;
-  const name=String(error?.name||'');
-  const message=String(error?.message||e);
-  if(name.includes('WalletSign')||message==='Unexpected error'){
-   const detail=String(error?.cause?.message||error?.reason||'');
-   throw new Error(`Phantom or the wallet adapter could not sign the Devnet launch transaction (${name||'wallet error'}: ${message}). Check that Phantom Testnet Mode is enabled for Solana Devnet, that the wallet has Devnet SOL, and that no previous launch was confirmed. Do not keep retrying without checking transaction activity.${detail?' Details: '+detail:''}`,{cause:e});
-  }
-  throw e;
+
+ const keys=message.staticAccountKeys;
+
+ const signers=keys.slice(
+  0,message.header.numRequiredSignatures
+ );
+
+ if(signers.length!==2||
+    !signers[0].equals(payer)||
+    !signers[1].equals(mint.publicKey))
+  throw new Error('Unexpected transaction signers');
+
+ const allowed=new Set([
+  programId.toBase58(),
+  SystemProgram.programId.toBase58(),
+  TOKEN_PROGRAM_ID.toBase58(),
+  'TokenzQdBNbLqP5VEhdkAS6EPFZ6LKruL4y3Yz9KP',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+  'ComputeBudget111111111111111111111111111111',
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'
+ ]);
+
+ const programs=message.compiledInstructions.map(
+  ix=>resolvedKeys.get(ix.programIdIndex)?.toBase58()
+ );
+
+ if(!programs.includes(programId.toBase58())||
+    programs.some(id=>!id||!allowed.has(id)))
+  throw new Error('Unreviewed program in launch transaction');
+
+ const bh=await connection.getLatestBlockhash('confirmed');
+
+ const tx=new VersionedTransaction(message);
+ tx.message.recentBlockhash=bh.blockhash;
+
+ tx.sign([mint]);
+
+ if(tx.serialize().length>1232)
+  throw new Error('Transaction exceeds Solana size limit');
+
+ const sim=await connection.simulateTransaction(tx,{
+  sigVerify:false,
+  commitment:'confirmed'
+ });
+
+ if(sim.value.err)
+  throw new Error(
+   'Devnet simulation failed: '+
+   JSON.stringify(sim.value.err)+' | '+
+   (sim.value.logs||[]).slice(-15).join(' | ')
+  );
+
+ const expected=tx.message.serialize();
+ let signed:VersionedTransaction;
+
+ try {
+  signed=await wallet.signTransaction(tx) as VersionedTransaction;
+ } catch(e) {
+  throw new Error(
+   'Phantom rejected transaction. Do not bypass safety warnings. '+
+   String((e as Error).message||e)
+  );
  }
- if(!Array.isArray(txIds)||!txIds.length)throw new Error('No confirmed creation transaction returned');
- return {mint:mint.publicKey.toBase58(),poolId:extInfo.address.poolId.toBase58(),programId:programId.toBase58(),txSignature:txIds.at(-1)!};
+
+ if(!(signed instanceof VersionedTransaction))
+  throw new Error('Invalid signed transaction type');
+
+ const actual=signed.message.serialize();
+
+ if(actual.length!==expected.length||
+    actual.some((b,i)=>b!==expected[i]))
+  throw new Error('Wallet changed transaction message');
+
+ if(signed.signatures.length!==2||
+    signed.signatures.some(sig=>!sig.some(b=>b!==0)))
+  throw new Error('Required signature missing');
+
+ const signature=await connection.sendRawTransaction(
+  signed.serialize(),
+  {
+   skipPreflight:false,
+   preflightCommitment:'confirmed',
+   maxRetries:0
+  }
+ );
+
+ let confirmation;
+
+ try {
+  confirmation=await connection.confirmTransaction(
+   {signature,...bh},
+   'confirmed'
+  );
+ } catch(e) {
+  throw new Error(
+   'Submission status uncertain. Check Devnet transaction '+
+   signature+' before retrying. '+String(e)
+  );
+ }
+
+ if(confirmation.value.err)
+  throw new Error(
+   'Transaction '+signature+' failed: '+
+   JSON.stringify(confirmation.value.err)
+  );
+
+ return {
+  mint:mint.publicKey.toBase58(),
+  poolId:built.extInfo.address.poolId.toBase58(),
+  programId:programId.toBase58(),
+  txSignature:signature
+ };
 }
+
 export async function curveTrade(connection:Connection,config:AppConfig,wallet:WalletContextState,item:Launch,side:'buy'|'sell',amount:string,slippageBps:number){
  if(!wallet.publicKey||!wallet.signAllTransactions)throw new Error('Connect wallet');
  if(config.network==='mainnet-beta'&&!config.mainnetTradingEnabled)throw new Error('Mainnet trading is disabled until reviewed');
