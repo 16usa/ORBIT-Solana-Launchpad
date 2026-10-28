@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "ORBIT Solana Launchpad"
+description = "The existing ORBIT Solana token launchpad project, configured to run on Devnet with a responsive English interface, wallet connection, and its original API and Raydium LaunchLab integration."
+version = "1.0.0"
+id = "artifacts/orbit-launchpad"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 21532
+
+[services.development]
+run = "pnpm --filter @workspace/orbit-launchpad run dev"
+
+[services.production]
+build = ["pnpm", "--filter", "@workspace/orbit-launchpad", "run", "build"]
+serve = "static"
+publicDir = "artifacts/orbit-launchpad/original/orbit-solana-launchpad/dist"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "21532"
+BASE_PATH = "/"

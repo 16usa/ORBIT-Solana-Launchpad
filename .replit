@@ -18,3 +18,13 @@ expertMode = true
 [postMerge]
 path = "scripts/post-merge.sh"
 timeoutMs = 20000
+
+[userenv]
+
+[userenv.development]
+API_PORT = "3000"
+PUBLIC_BASE_URL = "https://c0122279-cf36-4f32-8acd-17050ab230c2-00-2f3brla7izimq.worf.replit.dev"
+RPC_URL = "https://api.devnet.solana.com"
+SOLANA_CLUSTER = "devnet"
+VITE_RPC_URL = "https://api.devnet.solana.com"
+RAYDIUM_PROGRAM_ID = "DRay6fNdQ5J82H7xV6uq2aV3mNrUZ1J4PgSKsWgptcm6"
