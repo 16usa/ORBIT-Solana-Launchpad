@@ -14,6 +14,19 @@ const cluster=process.env.SOLANA_CLUSTER==='mainnet-beta'?'mainnet-beta':'devnet
 const rpcUrl=process.env.RPC_URL||(cluster==='devnet'?'https://api.devnet.solana.com':'https://api.mainnet-beta.solana.com');
 const rpcPublic=process.env.VITE_RPC_URL||(cluster==='devnet'?'https://api.devnet.solana.com':'https://api.mainnet-beta.solana.com');
 const publicBase=formatPublicUrl(process.env.PUBLIC_BASE_URL||'');
+// Fail closed: this prototype has local, non-durable metadata and is NOT safe for mainnet launches.
+const launchEnabled=cluster==='devnet' && !!publicBase && !!process.env.RAYDIUM_PROGRAM_ID;
+const launchBlockReason=cluster==='mainnet-beta'
+  ? 'Mainnet token creation is disabled pending permanent metadata storage, integration tests and a security review.'
+  : !publicBase
+    ? 'Set PUBLIC_BASE_URL to a reachable HTTPS origin before testing Devnet launches.'
+    : !process.env.RAYDIUM_PROGRAM_ID
+      ? 'Set the verified Raydium Devnet program ID (RAYDIUM_PROGRAM_ID) before launching.'
+      : '';
+// A Jupiter API key by itself must never enable real-money trades accidentally.
+const mainnetTradingEnabled=cluster==='mainnet-beta'
+  && process.env.ENABLE_MAINNET_TRADING==='true'
+  && !!process.env.JUPITER_API_KEY;
 const launchesFile=path.join(dataDir,'launches.json');
 const metadir=path.join(dataDir,'metadata');
 const mediaDir=path.join(dataDir,'media');
@@ -45,15 +58,17 @@ async function checkChain(input){
  if(!['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA','TokenzQdBNbLqP5VEhdkAS6EPFZ6LKruL4y3Yz9KP'].includes(mintInfo.value.owner))throw new Error('Account is not an SPL mint');
  if(poolInfo.value.owner!==input.programId)throw new Error('Pool program owner mismatch');
  const allowed=process.env.RAYDIUM_PROGRAM_ID;
- if(cluster==='mainnet-beta' && !allowed)throw new Error('RAYDIUM_PROGRAM_ID allowlist is required on mainnet');
- if(allowed && input.programId!==allowed)throw new Error('Program is not allowlisted');
+ if(!allowed)throw new Error('RAYDIUM_PROGRAM_ID allowlist is required before registering any launch');
+ if(input.programId!==allowed)throw new Error('Program is not allowlisted');
+ const instructions=transaction.transaction.message.instructions||[];
+ if(!instructions.some(i=>i.programId===allowed))throw new Error('Launch transaction did not invoke the allowlisted Raydium program');
  return {verified:true,confidence:allowed?'allowlisted-launch-accounts':'transaction-accounts'};
 }
 export function makeServer(){return http.createServer(async(req,res)=>{
  try{
   const u=new URL(req.url||'/', 'http://localhost');const pathname=u.pathname;
   if(pathname==='/api/health'){return json(res,200,{ok:true,network:cluster});}
-  if(pathname==='/api/config'){return json(res,200,{network:cluster,rpc:rpcPublic,publicBase,tradeEnabled:!!process.env.JUPITER_API_KEY,raydiumProgramAllowlisted:!!process.env.RAYDIUM_PROGRAM_ID});}
+  if(pathname==='/api/config'){return json(res,200,{network:cluster,rpc:rpcPublic,publicBase,tradeEnabled:mainnetTradingEnabled,mainnetTradingEnabled,launchEnabled,launchBlockReason,raydiumProgramAllowlisted:!!process.env.RAYDIUM_PROGRAM_ID});}
   if(pathname==='/api/launches'&&req.method==='GET'){
    const all=loadStore(launchesFile,[]);
    return json(res,200,{items:all.slice(0,100)});
@@ -69,13 +84,16 @@ export function makeServer(){return http.createServer(async(req,res)=>{
   if(pathname==='/api/metadata'&&req.method==='POST'){
    const m=metadataInput(await readJson(req,10_000));const files=fs.readdirSync(mediaDir);const filename=files.find(v=>v.startsWith(m.imageId+'.'));
    if(!filename) return error(res,400,'Upload image first');
+   if(!launchEnabled)return error(res,503,launchBlockReason);
    if(!publicBase) return error(res,503,'PUBLIC_BASE_URL (public HTTPS URL) is required for on-chain metadata');
    const id=randomUUID();const jsonMeta={name:m.name,symbol:m.symbol,description:m.description,image:`${publicBase}/media/${filename}`,external_url:m.website||'',properties:{category:'image'},extensions:{website:m.website||'',twitter:m.twitter||'',telegram:m.telegram||''}};
    fs.writeFileSync(path.join(metadir,id+'.json'),JSON.stringify(jsonMeta,null,2),{flag:'wx'});
    return json(res,201,{id,uri:`${publicBase}/metadata/${id}.json`,metadata:jsonMeta});
   }
   if(pathname==='/api/launches' && req.method==='POST'){
-   const v=parseLaunchInput(await readJson(req,4000));const metadataFile=path.join(metadir,v.metadataId+'.json');
+   const v=parseLaunchInput(await readJson(req,4000));
+   if(!launchEnabled)return error(res,503,launchBlockReason);
+   const metadataFile=path.join(metadir,v.metadataId+'.json');
    if(!fs.existsSync(metadataFile))return error(res,400,'Metadata missing');
    const verified=await checkChain(v);
    const all=loadStore(launchesFile,[]);
@@ -87,7 +105,7 @@ export function makeServer(){return http.createServer(async(req,res)=>{
   }
   // Jupiter V2 API proxies: wallet signs client-side; server never receives a secret key.
   if(pathname==='/api/swap/order'&&req.method==='GET'){
-   if(cluster!=='mainnet-beta'||!process.env.JUPITER_API_KEY)return error(res,503,'Mainnet Jupiter API not configured');
+   if(!mainnetTradingEnabled)return error(res,503,'Mainnet trading is disabled until explicitly enabled and reviewed');
    const p=new URLSearchParams();for(const key of ['inputMint','outputMint','amount','taker']){
     const val=u.searchParams.get(key)||'';
     if(key==='amount'?!/^\d{1,20}$/.test(val):!validMint(val))return error(res,400,'Invalid '+key);
@@ -97,7 +115,7 @@ export function makeServer(){return http.createServer(async(req,res)=>{
    return json(res,r.status,await r.json());
   }
   if(pathname==='/api/swap/execute'&&req.method==='POST'){
-   if(cluster!=='mainnet-beta'||!process.env.JUPITER_API_KEY)return error(res,503,'Mainnet Jupiter API not configured');
+   if(!mainnetTradingEnabled)return error(res,503,'Mainnet trading is disabled until explicitly enabled and reviewed');
    const b=await readJson(req,18000);
    if(!b||typeof b.requestId!=='string'||typeof b.signedTransaction!=='string'||!/^[-_A-Za-z0-9+/=]{100,16000}$/.test(b.signedTransaction))return error(res,400,'Invalid signed swap payload');
    const r=await fetch('https://api.jup.ag/swap/v2/execute',{method:'POST',headers:{'content-type':'application/json','x-api-key':process.env.JUPITER_API_KEY},body:JSON.stringify({requestId:b.requestId,signedTransaction:b.signedTransaction}),signal:AbortSignal.timeout(30000)});

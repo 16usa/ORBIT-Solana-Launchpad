@@ -47,7 +47,8 @@ export function formatPublicUrl(base){
  if(!base)return '';
  const uri=new URL(base);
  if(uri.protocol!=='https:' && !/^http:\/\/localhost(?::\d+)?$/.test(base)) throw new Error('PUBLIC_BASE_URL must use HTTPS');
- return uri.href.replace(/\/$/,'');
+ if(uri.username||uri.password||uri.search||uri.hash||uri.pathname!=='/')throw new Error('PUBLIC_BASE_URL must be an origin without credentials, path, query or fragment');
+ return uri.origin;
 }
 export function headersJson(extra={}){return {'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff',...extra};}
 export function stableHash(value){return createHash('sha256').update(value).digest('hex').slice(0,12);}

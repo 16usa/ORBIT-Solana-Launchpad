@@ -25,6 +25,7 @@ export async function getPool(connection:Connection,config:AppConfig,mint:string
 }
 export async function launchToken(connection:Connection,config:AppConfig,wallet:WalletContextState,input:{name:string;symbol:string;uri:string}){
  if(!wallet.publicKey||!wallet.signAllTransactions)throw new Error('Connect a wallet that supports transaction signing');
+ if(!config.launchEnabled)throw new Error(config.launchBlockReason||'Token creation is currently disabled');
  const raydium=await sdk(connection,config,wallet);
  const programId=program(config);const mint=Keypair.generate();
  const configId=getPdaLaunchpadConfigId(programId,NATIVE_MINT,0,0).publicKey;
@@ -43,6 +44,7 @@ export async function launchToken(connection:Connection,config:AppConfig,wallet:
 }
 export async function curveTrade(connection:Connection,config:AppConfig,wallet:WalletContextState,item:Launch,side:'buy'|'sell',amount:string,slippageBps:number){
  if(!wallet.publicKey||!wallet.signAllTransactions)throw new Error('Connect wallet');
+ if(config.network==='mainnet-beta'&&!config.mainnetTradingEnabled)throw new Error('Mainnet trading is disabled until reviewed');
  if(slippageBps<10||slippageBps>500)throw new Error('Allowed slippage: 0.1% to 5%');
  const raydium=await sdk(connection,config,wallet);const mintA=new PublicKey(item.mint),programId=new PublicKey(item.programId);
  const p=await raydium.launchpad.getRpcPoolInfo({poolId:new PublicKey(item.poolId)});

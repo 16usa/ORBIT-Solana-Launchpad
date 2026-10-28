@@ -38,3 +38,20 @@ test('API returns real empty launch list without fake data',async()=>{
   const bad=await fetch(`${base}/api/swap/order?inputMint=x`);assert.equal(bad.status,503);
  }finally{await new Promise(r=>server.close(r))}
 });
+
+test('Metadata origin URL rejects unsafe paths, credentials and query strings',()=>{
+ assert.throws(()=>formatPublicUrl('https://demo.example/api?token=private'),/origin/);
+ assert.throws(()=>formatPublicUrl('https://user:secret@demo.example/'),/origin/);
+ assert.throws(()=>formatPublicUrl('https://demo.example/#temporary'),/origin/);
+});
+test('Launch readiness is explicit and boolean for UI safety checks',async()=>{
+ const server=makeServer();await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try{
+  const response=await fetch(`http://127.0.0.1:${server.address().port}/api/config`);
+  const config=await response.json();
+  assert.equal(typeof config.launchEnabled,'boolean');
+  assert.equal(typeof config.mainnetTradingEnabled,'boolean');
+  assert.equal(typeof config.launchBlockReason,'string');
+  assert.equal(config.launchEnabled && config.network==='mainnet-beta',false);
+ }finally{await new Promise(resolve=>server.close(resolve))}
+});

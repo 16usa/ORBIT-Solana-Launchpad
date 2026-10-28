@@ -11,5 +11,6 @@ export default defineConfig({
     port: Number(process.env.PORT || 5173),
     strictPort: true,
     allowedHosts: true,
+    proxy: Object.fromEntries(['/api', '/media', '/metadata'].map(route => [route, { target: `http://127.0.0.1:${process.env.API_PORT || '8080'}`, changeOrigin: true }])),
   },
 });
