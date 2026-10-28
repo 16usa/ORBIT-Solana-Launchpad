@@ -21,7 +21,7 @@ args = ["node", "artifacts/api-server/build-orbit-api.mjs"]
 NODE_ENV = "production"
 
 [services.production.run]
-args = ["node", "dist/orbit-api/server/app.mjs"]
+args = ["node", "artifacts/api-server/dist/orbit-api/server/app.mjs"]
 
 [services.production.run.env]
 PORT = "8080"

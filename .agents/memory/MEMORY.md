@@ -1,0 +1,1 @@
+- [Artifact production paths](artifact-production-paths.md) — production run commands resolve from the workspace root, not the artifact directory.
