@@ -1,4 +1,5 @@
 export type AppConfig={network:'devnet'|'mainnet-beta';rpc:string;publicBase:string;tradeEnabled:boolean;mainnetTradingEnabled:boolean;launchEnabled:boolean;launchBlockReason:string;raydiumProgramAllowlisted:boolean};
+export type NetworkStatus={network:string;rpcReachable:boolean;programDeployed:boolean;ready:boolean;slot:number|null;reason:string};
 export type Launch={mint:string;poolId:string;creator:string;programId:string;txSignature:string;metadataId:string;network:string;name:string;symbol:string;image:string;description:string;createdAt:string;verified:boolean;confidence:string};
 export const SOL='So11111111111111111111111111111111111111112';
 export async function callApi<T=any>(path:string,options?:RequestInit):Promise<T>{

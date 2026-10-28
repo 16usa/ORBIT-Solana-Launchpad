@@ -77,6 +77,24 @@ export function makeServer(){return http.createServer(async(req,res)=>{
    const mint=pathname.split('/').at(-1);return json(res,200,{item:loadStore(launchesFile,[]).find(l=>l.mint===mint)||null});
   }
   if(pathname.startsWith('/api/') && !hitRate(req))return error(res,429,'Rate limited');
+  // Live, non-cached Devnet preflight. Does not sign transactions or expose credentials.
+  if(pathname==='/api/network-status' && req.method==='GET'){
+   const programId=process.env.RAYDIUM_PROGRAM_ID||'';
+   const base={network:cluster,rpcReachable:false,programDeployed:false,ready:false,slot:null};
+   if(!validMint(programId))return json(res,200,{...base,reason:'Set a valid RAYDIUM_PROGRAM_ID in Replit environment settings.'});
+   if(!launchEnabled)return json(res,200,{...base,reason:launchBlockReason});
+   try{
+    const [slot,info]=await Promise.all([
+     rpcCall(rpcUrl,'getSlot',[{commitment:'confirmed'}]),
+     rpcCall(rpcUrl,'getAccountInfo',[programId,{encoding:'base64',commitment:'confirmed'}]),
+    ]);
+    const programDeployed=Boolean(info?.value?.executable);
+    return json(res,200,{...base,rpcReachable:true,programDeployed,ready:programDeployed,slot,
+      reason:programDeployed?'RPC and program reachable. LaunchLab config and wallet readiness still require verification.':'Allowlisted Raydium program is missing or not executable on this network.'});
+   }catch(err){
+    return json(res,200,{...base,reason:'Devnet RPC request failed: '+String(err?.message||err).slice(0,160)});
+   }
+  }
   if(pathname==='/api/media'&&req.method==='POST'){
    const body=await readJson(req);const {bytes,ext}=mediaBytes(body.base64);const id=randomUUID();fs.writeFileSync(path.join(mediaDir,id+'.'+ext),bytes,{flag:'wx'});
    return json(res,201,{id,uri:publicBase?`${publicBase}/media/${id}.${ext}`:null,extension:ext});

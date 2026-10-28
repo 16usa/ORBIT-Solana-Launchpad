@@ -14,8 +14,14 @@ run = "node ../orbit-launchpad/original/orbit-solana-launchpad/server/app.mjs"
 
 [services.production]
 
+[services.production.build]
+args = ["node", "artifacts/api-server/build-orbit-api.mjs"]
+
+[services.production.build.env]
+NODE_ENV = "production"
+
 [services.production.run]
-args = ["node", "../orbit-launchpad/original/orbit-solana-launchpad/server/app.mjs"]
+args = ["node", "dist/orbit-api/server/app.mjs"]
 
 [services.production.run.env]
 PORT = "8080"

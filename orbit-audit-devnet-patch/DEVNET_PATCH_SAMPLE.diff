@@ -1,0 +1,195 @@
+diff -ru '--exclude=.orbit-backups' '--exclude=ИНСТРУКЦИЯ_RU.md' orbit-solana-launchpad-en/server/app.mjs orbit-testpatch/server/app.mjs
+--- orbit-solana-launchpad-en/server/app.mjs	2026-10-28 02:44:30.869510647 +0000
++++ orbit-testpatch/server/app.mjs	2026-10-28 03:36:28.751375713 +0000
+@@ -14,6 +14,19 @@
+ const rpcUrl=process.env.RPC_URL||(cluster==='devnet'?'https://api.devnet.solana.com':'https://api.mainnet-beta.solana.com');
+ const rpcPublic=process.env.VITE_RPC_URL||(cluster==='devnet'?'https://api.devnet.solana.com':'https://api.mainnet-beta.solana.com');
+ const publicBase=formatPublicUrl(process.env.PUBLIC_BASE_URL||'');
++// Fail closed: this prototype has local, non-durable metadata and is NOT safe for mainnet launches.
++const launchEnabled=cluster==='devnet' && !!publicBase && !!process.env.RAYDIUM_PROGRAM_ID;
++const launchBlockReason=cluster==='mainnet-beta'
++  ? 'Mainnet token creation is disabled pending permanent metadata storage, integration tests and a security review.'
++  : !publicBase
++    ? 'Set PUBLIC_BASE_URL to a reachable HTTPS origin before testing Devnet launches.'
++    : !process.env.RAYDIUM_PROGRAM_ID
++      ? 'Set the verified Raydium Devnet program ID (RAYDIUM_PROGRAM_ID) before launching.'
++      : '';
++// A Jupiter API key by itself must never enable real-money trades accidentally.
++const mainnetTradingEnabled=cluster==='mainnet-beta'
++  && process.env.ENABLE_MAINNET_TRADING==='true'
++  && !!process.env.JUPITER_API_KEY;
+ const launchesFile=path.join(dataDir,'launches.json');
+ const metadir=path.join(dataDir,'metadata');
+ const mediaDir=path.join(dataDir,'media');
+@@ -45,15 +58,17 @@
+  if(!['TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA','TokenzQdBNbLqP5VEhdkAS6EPFZ6LKruL4y3Yz9KP'].includes(mintInfo.value.owner))throw new Error('Account is not an SPL mint');
+  if(poolInfo.value.owner!==input.programId)throw new Error('Pool program owner mismatch');
+  const allowed=process.env.RAYDIUM_PROGRAM_ID;
+- if(cluster==='mainnet-beta' && !allowed)throw new Error('RAYDIUM_PROGRAM_ID allowlist is required on mainnet');
+- if(allowed && input.programId!==allowed)throw new Error('Program is not allowlisted');
++ if(!allowed)throw new Error('RAYDIUM_PROGRAM_ID allowlist is required before registering any launch');
++ if(input.programId!==allowed)throw new Error('Program is not allowlisted');
++ const instructions=transaction.transaction.message.instructions||[];
++ if(!instructions.some(i=>i.programId===allowed))throw new Error('Launch transaction did not invoke the allowlisted Raydium program');
+  return {verified:true,confidence:allowed?'allowlisted-launch-accounts':'transaction-accounts'};
+ }
+ export function makeServer(){return http.createServer(async(req,res)=>{
+  try{
+   const u=new URL(req.url||'/', 'http://localhost');const pathname=u.pathname;
+   if(pathname==='/api/health'){return json(res,200,{ok:true,network:cluster});}
+-  if(pathname==='/api/config'){return json(res,200,{network:cluster,rpc:rpcPublic,publicBase,tradeEnabled:!!process.env.JUPITER_API_KEY,raydiumProgramAllowlisted:!!process.env.RAYDIUM_PROGRAM_ID});}
++  if(pathname==='/api/config'){return json(res,200,{network:cluster,rpc:rpcPublic,publicBase,tradeEnabled:mainnetTradingEnabled,mainnetTradingEnabled,launchEnabled,launchBlockReason,raydiumProgramAllowlisted:!!process.env.RAYDIUM_PROGRAM_ID});}
+   if(pathname==='/api/launches'&&req.method==='GET'){
+    const all=loadStore(launchesFile,[]);
+    return json(res,200,{items:all.slice(0,100)});
+@@ -69,13 +84,16 @@
+   if(pathname==='/api/metadata'&&req.method==='POST'){
+    const m=metadataInput(await readJson(req,10_000));const files=fs.readdirSync(mediaDir);const filename=files.find(v=>v.startsWith(m.imageId+'.'));
+    if(!filename) return error(res,400,'Upload image first');
++   if(!launchEnabled)return error(res,503,launchBlockReason);
+    if(!publicBase) return error(res,503,'PUBLIC_BASE_URL (public HTTPS URL) is required for on-chain metadata');
+    const id=randomUUID();const jsonMeta={name:m.name,symbol:m.symbol,description:m.description,image:`${publicBase}/media/${filename}`,external_url:m.website||'',properties:{category:'image'},extensions:{website:m.website||'',twitter:m.twitter||'',telegram:m.telegram||''}};
+    fs.writeFileSync(path.join(metadir,id+'.json'),JSON.stringify(jsonMeta,null,2),{flag:'wx'});
+    return json(res,201,{id,uri:`${publicBase}/metadata/${id}.json`,metadata:jsonMeta});
+   }
+   if(pathname==='/api/launches' && req.method==='POST'){
+-   const v=parseLaunchInput(await readJson(req,4000));const metadataFile=path.join(metadir,v.metadataId+'.json');
++   const v=parseLaunchInput(await readJson(req,4000));
++   if(!launchEnabled)return error(res,503,launchBlockReason);
++   const metadataFile=path.join(metadir,v.metadataId+'.json');
+    if(!fs.existsSync(metadataFile))return error(res,400,'Metadata missing');
+    const verified=await checkChain(v);
+    const all=loadStore(launchesFile,[]);
+@@ -87,7 +105,7 @@
+   }
+   // Jupiter V2 API proxies: wallet signs client-side; server never receives a secret key.
+   if(pathname==='/api/swap/order'&&req.method==='GET'){
+-   if(cluster!=='mainnet-beta'||!process.env.JUPITER_API_KEY)return error(res,503,'Mainnet Jupiter API not configured');
++   if(!mainnetTradingEnabled)return error(res,503,'Mainnet trading is disabled until explicitly enabled and reviewed');
+    const p=new URLSearchParams();for(const key of ['inputMint','outputMint','amount','taker']){
+     const val=u.searchParams.get(key)||'';
+     if(key==='amount'?!/^\d{1,20}$/.test(val):!validMint(val))return error(res,400,'Invalid '+key);
+@@ -97,7 +115,7 @@
+    return json(res,r.status,await r.json());
+   }
+   if(pathname==='/api/swap/execute'&&req.method==='POST'){
+-   if(cluster!=='mainnet-beta'||!process.env.JUPITER_API_KEY)return error(res,503,'Mainnet Jupiter API not configured');
++   if(!mainnetTradingEnabled)return error(res,503,'Mainnet trading is disabled until explicitly enabled and reviewed');
+    const b=await readJson(req,18000);
+    if(!b||typeof b.requestId!=='string'||typeof b.signedTransaction!=='string'||!/^[-_A-Za-z0-9+/=]{100,16000}$/.test(b.signedTransaction))return error(res,400,'Invalid signed swap payload');
+    const r=await fetch('https://api.jup.ag/swap/v2/execute',{method:'POST',headers:{'content-type':'application/json','x-api-key':process.env.JUPITER_API_KEY},body:JSON.stringify({requestId:b.requestId,signedTransaction:b.signedTransaction}),signal:AbortSignal.timeout(30000)});
+diff -ru '--exclude=.orbit-backups' '--exclude=ИНСТРУКЦИЯ_RU.md' orbit-solana-launchpad-en/server/core.mjs orbit-testpatch/server/core.mjs
+--- orbit-solana-launchpad-en/server/core.mjs	2026-10-28 02:42:39.240105559 +0000
++++ orbit-testpatch/server/core.mjs	2026-10-28 03:36:28.751485057 +0000
+@@ -47,7 +47,8 @@
+  if(!base)return '';
+  const uri=new URL(base);
+  if(uri.protocol!=='https:' && !/^http:\/\/localhost(?::\d+)?$/.test(base)) throw new Error('PUBLIC_BASE_URL must use HTTPS');
+- return uri.href.replace(/\/$/,'');
++ if(uri.username||uri.password||uri.search||uri.hash||uri.pathname!=='/')throw new Error('PUBLIC_BASE_URL must be an origin without credentials, path, query or fragment');
++ return uri.origin;
+ }
+ export function headersJson(extra={}){return {'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff',...extra};}
+ export function stableHash(value){return createHash('sha256').update(value).digest('hex').slice(0,12);}
+diff -ru '--exclude=.orbit-backups' '--exclude=ИНСТРУКЦИЯ_RU.md' orbit-solana-launchpad-en/tests/server.test.mjs orbit-testpatch/tests/server.test.mjs
+--- orbit-solana-launchpad-en/tests/server.test.mjs	2026-10-28 02:42:28.149021307 +0000
++++ orbit-testpatch/tests/server.test.mjs	2026-10-28 03:36:28.752954594 +0000
+@@ -38,3 +38,20 @@
+   const bad=await fetch(`${base}/api/swap/order?inputMint=x`);assert.equal(bad.status,503);
+  }finally{await new Promise(r=>server.close(r))}
+ });
++
++test('Metadata origin URL rejects unsafe paths, credentials and query strings',()=>{
++ assert.throws(()=>formatPublicUrl('https://demo.example/api?token=private'),/origin/);
++ assert.throws(()=>formatPublicUrl('https://user:secret@demo.example/'),/origin/);
++ assert.throws(()=>formatPublicUrl('https://demo.example/#temporary'),/origin/);
++});
++test('Launch readiness is explicit and boolean for UI safety checks',async()=>{
++ const server=makeServer();await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
++ try{
++  const response=await fetch(`http://127.0.0.1:${server.address().port}/api/config`);
++  const config=await response.json();
++  assert.equal(typeof config.launchEnabled,'boolean');
++  assert.equal(typeof config.mainnetTradingEnabled,'boolean');
++  assert.equal(typeof config.launchBlockReason,'string');
++  assert.equal(config.launchEnabled && config.network==='mainnet-beta',false);
++ }finally{await new Promise(resolve=>server.close(resolve))}
++});
+diff -ru '--exclude=.orbit-backups' '--exclude=ИНСТРУКЦИЯ_RU.md' orbit-solana-launchpad-en/vite.config.ts orbit-testpatch/vite.config.ts
+--- orbit-solana-launchpad-en/vite.config.ts	2026-10-28 02:40:44.910880163 +0000
++++ orbit-testpatch/vite.config.ts	2026-10-28 03:36:28.752738311 +0000
+@@ -5,5 +5,5 @@
+   publicDir: 'public',
+   build: { outDir: '../dist', emptyOutDir: true, target: 'es2022' },
+   define: { 'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV ?? 'development') },
+-  server: { host: '0.0.0.0', port: 5173, proxy: { '/api': 'http://127.0.0.1:3000', '/media': 'http://127.0.0.1:3000', '/metadata': 'http://127.0.0.1:3000' } }
++  server: { host: '0.0.0.0', port: 5173, proxy: { '/api': `http://127.0.0.1:${process.env.API_PORT || '3000'}`, '/media': `http://127.0.0.1:${process.env.API_PORT || '3000'}`, '/metadata': `http://127.0.0.1:${process.env.API_PORT || '3000'}` } }
+ });
+diff -ru '--exclude=.orbit-backups' '--exclude=ИНСТРУКЦИЯ_RU.md' orbit-solana-launchpad-en/web/src/App.tsx orbit-testpatch/web/src/App.tsx
+--- orbit-solana-launchpad-en/web/src/App.tsx	2026-10-28 02:51:05.675738156 +0000
++++ orbit-testpatch/web/src/App.tsx	2026-10-28 03:36:28.752430120 +0000
+@@ -43,7 +43,7 @@
+  const update=(k:string,v:string)=>setForm(p=>({...p,[k]:v}));
+  const onFile=(f?:File)=>{if(!f)return;if(f.size>5_000_000){notify('Maximum image size is 5 MB');return}if(!['image/png','image/jpeg','image/gif','image/webp'].includes(f.type)){notify('Supported formats: PNG, JPG, GIF, and WebP');return}setFile(f);setImagePreview(URL.createObjectURL(f))};
+  function uploadBase64(file:File):Promise<string>{return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(file)})}
+- async function create(e:React.FormEvent){e.preventDefault();if(!wallet.publicKey){notify('Connect your wallet first');return}if(!file){notify('Upload a token image');return}if(!config.publicBase){notify('Set PUBLIC_BASE_URL to your public HTTPS domain on the server first');return}
++ async function create(e:React.FormEvent){e.preventDefault();if(!wallet.publicKey){notify('Connect your wallet first');return}if(!file){notify('Upload a token image');return}if(!config.launchEnabled){notify(config.launchBlockReason||'Token creation is currently disabled');return}
+  setBusy(true);setReceipt('');try{
+   const uploaded=await postJson<{id:string}>('/api/media',{base64:await uploadBase64(file)});
+   const meta=await postJson<{id:string;uri:string}>('/api/metadata',{...form,imageId:uploaded.id});
+@@ -57,15 +57,15 @@
+  return <div className="create-wrap"><div className="create-header"><button className="back-link" onClick={()=>navigate('discover')}><ArrowLeft size={17}/> Back</button><h1>Create a new token</h1><p>The token and bonding curve are created on Solana through Raydium LaunchLab. You must approve each transaction in your wallet.</p></div>
+  <form onSubmit={create} className="form-layout"><div className="form-main"><div className="panel"><div className="panel-label">Token details</div><p className="micro-note">The token name and ticker cannot be changed after creation.</p><label>Token name <input required maxLength={32} minLength={2} placeholder="Name your coin" value={form.name} onChange={e=>update('name',e.target.value)}/></label><label>Ticker <input required maxLength={10} minLength={2} pattern="[a-zA-Z0-9_]+" placeholder="e.g., ORB" value={form.symbol} onChange={e=>update('symbol',e.target.value)}/></label><label>Description (optional) <textarea maxLength={800} rows={4} placeholder="What is your project about?" value={form.description} onChange={e=>update('description',e.target.value)}/></label><button type="button" className="text-toggle" onClick={()=>setAdvanced(!advanced)}>Add social links <ChevronDown size={15} style={{transform:advanced?'rotate(180deg)':undefined}}/></button>{advanced&&<div className="socials">{(['website','twitter','telegram'] as const).map(k=><label key={k}>{k==='website'?'Website':k==='twitter'?'X / Twitter':'Telegram'} <input type="url" placeholder="https://..." value={form[k]} onChange={e=>update(k,e.target.value)}/></label>)}</div>}<hr/><div className="panel-label">Liquidity asset</div><div className="sol-choice">≋ <strong>SOL</strong> <span>Raydium LaunchLab</span></div><p className="micro-note">The initial quote asset is SOL. The token launches on a bonding curve and may migrate to a Raydium pool when the protocol requirements are met.</p></div>
+  <div className="panel"><div className="panel-label">Coin image</div><label className="drop-zone"><input type="file" accept="image/png,image/jpeg,image/gif,image/webp" onChange={e=>onFile(e.target.files?.[0])} hidden/>{imagePreview?<img className="file-preview" src={imagePreview} alt="Token preview"/>:<Upload size={33}/>}<strong>{file?file.name:'Select an image'}</strong><small>PNG, JPG, GIF, WebP · up to 5 MB</small></label></div></div>
+- <aside className="form-side"><div className="panel sticky-panel"><div className="panel-label">Launch settings</div><div className="property"><span>Network</span><b>{config.network==='devnet'?'Solana Devnet':'Solana Mainnet'}</b></div><div className="property"><span>Protocol</span><b>Raydium LaunchLab</b></div><div className="property"><span>Type</span><b>Bonding curve</b></div><div className="property"><span>Initial buy</span><b>None</b></div><div className="property"><span>Fee</span><b>Set by the protocol</b></div><Banner>All network fees and transactions must be approved in your wallet. Private keys are never sent to the app.</Banner>{receipt&&<p className="success-receipt">Created token address: <code>{receipt}</code></p>}{!config.publicBase&&<p className="warning-text">Token creation requires PUBLIC_BASE_URL set to a public HTTPS URL.</p>}
+- {wallet.publicKey?<button className="button green-button full" type="submit" disabled={busy||!config.publicBase}>{busy?<><LoaderCircle className="spin" size={18}/> Approve in your wallet…</>:<><Rocket size={17}/> Create token on Solana</>}</button>:<div className="center-wallet"><WalletMultiButton/></div>}
++ <aside className="form-side"><div className="panel sticky-panel"><div className="panel-label">Launch settings</div><div className="property"><span>Network</span><b>{config.network==='devnet'?'Solana Devnet':'Solana Mainnet'}</b></div><div className="property"><span>Protocol</span><b>Raydium LaunchLab</b></div><div className="property"><span>Type</span><b>Bonding curve</b></div><div className="property"><span>Initial buy</span><b>None</b></div><div className="property"><span>Fee</span><b>Set by the protocol</b></div><Banner>All network fees and transactions must be approved in your wallet. Private keys are never sent to the app.</Banner>{receipt&&<p className="success-receipt">Created token address: <code>{receipt}</code></p>}{!config.launchEnabled&&<p className="warning-text">{config.launchBlockReason}</p>}
++ {wallet.publicKey?<button className="button green-button full" type="submit" disabled={busy||!config.launchEnabled}>{busy?<><LoaderCircle className="spin" size={18}/> Approve in your wallet…</>:<><Rocket size={17}/> Create token on Solana</>}</button>:<div className="center-wallet"><WalletMultiButton/></div>}
+  </div></aside></form></div>;
+ }
+ function TokenDetails({item,config,pool,graph,notify}:{item?:Launch;config:AppConfig;pool?:PoolView;graph:number[];notify:(m:string)=>void}){
+  const {connection}=useConnection();const wallet=useWallet();const [side,setSide]=useState<'buy'|'sell'>('buy');const [route,setRoute]=useState<'curve'|'jupiter'>('curve');const [amount,setAmount]=useState('0.1');const [slip,setSlip]=useState('1');const [busy,setBusy]=useState(false);const [sig,setSig]=useState('');
+  const display=useMemo(()=>item,[item]);if(!display)return <Empty icon={<Search/>} heading="Token not found" body="This address is not in the Orbit registry." action={<button className="button" onClick={()=>navigate('discover')}>Open catalog</button>}/>;
+  const explorer=(sig:string)=>`https://solscan.io/tx/${sig}${config.network==='devnet'?'?cluster=devnet':''}`;
+- async function trade(){if(!wallet.publicKey){notify('Connect wallet');return}if(route==='jupiter'&&!config.tradeEnabled){notify('Configure JUPITER_API_KEY to enable Jupiter');return}setBusy(true);setSig('');try{
++ async function trade(){if(!wallet.publicKey){notify('Connect wallet');return}if(config.network==='mainnet-beta'&&!config.mainnetTradingEnabled){notify('Mainnet trading is disabled until reviewed');return}if(route==='jupiter'&&!config.tradeEnabled){notify('Jupiter swaps are not enabled');return}setBusy(true);setSig('');try{
+   const tx=route==='jupiter'?await migratedTrade(wallet,display,side,amount):await curveTrade(connection,config,wallet,display,side,amount,Math.round(Number(slip)*100));
+   setSig(tx);notify('Transaction submitted and confirmed');
+  }catch(err){notify((err as Error).message)}finally{setBusy(false)} }
+@@ -73,7 +73,7 @@
+  <div className="detail-grid"><section className="detail-main"><div className="stats-grid"><div className="stat"><small>Token price</small><strong>{pool?`${pool.priceSol.toExponential(5)} SOL`:'No data'}</strong></div><div className="stat"><small>Curve progress</small><strong>{pool?`${pool.progress.toFixed(2)}%`:'No data'}</strong></div><div className="stat"><small>SOL raised</small><strong>{pool?pool.raisedSol.toFixed(3):'—'}</strong></div><div className="stat"><small>SOL target</small><strong>{pool?pool.targetSol.toFixed(2):'—'}</strong></div></div><div className="chart-shell"><div className="chart-top"><b>Price history</b><span>Real RPC snapshots (this session only)</span></div>{graph.length>1?<div className="price-chart"><MiniGraph values={graph}/></div>:<div className="no-chart"><BarChart3 size={33}/><strong>No price history yet</strong><span>The chart will appear after a few price updates. Historical candles require a dedicated indexer.</span></div>}</div>
+  <div className="panel"><h3>About the token</h3><p>{display.description||'No description provided'}</p><div className="property"><span>Creator</span><b>{shorten(display.creator,7)}</b></div><div className="property"><span>Mint</span><b><ExplorerUrl network={config.network} mint={display.mint}>{shorten(display.mint,9)} <ArrowUpRight size={13}/></ExplorerUrl></b></div><div className="property"><span>Pool</span><b>{shorten(display.poolId,8)}</b></div><div className="property"><span>Verification</span><b className="green">On-chain account</b></div></div></section>
+  <aside className="trade-panel panel"><h3>Trade</h3><div className="side-tabs"><button className={side==='buy'?'on buy':''} onClick={()=>setSide('buy')}>Buy</button><button className={side==='sell'?'on sell':''} onClick={()=>setSide('sell')}>Sell</button></div><label>Route <select value={route} onChange={e=>setRoute(e.target.value as any)}><option value="curve">Bonding curve (before migration)</option><option value="jupiter">Jupiter (after migration)</option></select></label><label>Amount <div className="amount-wrap"><input type="text" inputMode="decimal" value={amount} onChange={e=>setAmount(e.target.value)}/><b>{side==='buy'?'SOL':display.symbol}</b></div></label>{route==='curve'&&<label>Max slippage (%) <input type="number" min="0.1" max="5" step="0.1" value={slip} onChange={e=>setSlip(e.target.value)}/></label>}
+- <Banner>Prices can change quickly. Buys and sells submit real transactions. Fees, slippage and network costs depend on execution conditions.</Banner><button className={'button full '+(side==='buy'?'green-button':'red-button')} onClick={trade} disabled={busy||!wallet.publicKey||route==='jupiter'&&!config.tradeEnabled}>{busy?<><LoaderCircle className="spin"/> Approve in wallet…</>:`${side==='buy'?'Buy':'Sell'} ${display.symbol}`}</button>{!wallet.publicKey&&<div className="center-wallet"><WalletMultiButton/></div>}{sig&&<a className="tx-link" href={explorer(sig)} rel="noreferrer" target="_blank"><CheckCircle2 size={15}/> View transaction <ExternalLink size={14}/></a>}</aside></div></div>;
++ <Banner>Prices can change quickly. Buys and sells submit real transactions. Fees, slippage and network costs depend on execution conditions.</Banner><button className={'button full '+(side==='buy'?'green-button':'red-button')} onClick={trade} disabled={busy||!wallet.publicKey||config.network==='mainnet-beta'&&!config.mainnetTradingEnabled||route==='jupiter'&&!config.tradeEnabled}>{busy?<><LoaderCircle className="spin"/> Approve in wallet…</>:`${side==='buy'?'Buy':'Sell'} ${display.symbol}`}</button>{!wallet.publicKey&&<div className="center-wallet"><WalletMultiButton/></div>}{sig&&<a className="tx-link" href={explorer(sig)} rel="noreferrer" target="_blank"><CheckCircle2 size={15}/> View transaction <ExternalLink size={14}/></a>}</aside></div></div>;
+ }
+ function Profile({items,config,notify}:{items:Launch[];config:AppConfig;notify:(m:string)=>void}){const {publicKey}=useWallet();const wallet=publicKey?.toBase58();const myItems=items.filter(i=>i.creator===wallet);return <div><div className="page-heading"><small className="eyebrow">ACCOUNT</small><h1>My profile</h1></div>{wallet?<><div className="profile-banner"><Wallet size={24}/><div><b>{shorten(wallet,9)}</b><small>Connected wallet · {config.network}</small></div><IconButton title="Copy address" onClick={()=>{navigator.clipboard.writeText(wallet);notify('Address copied')}}><Copy size={17}/></IconButton></div><h2 className="section-heading">My launches <span>{myItems.length}</span></h2>{myItems.length?<div className="profile-list">{myItems.map(l=><button key={l.mint} className="profile-item" onClick={()=>navigate('token',l.mint)}><CoinAvatar l={l}/><span><strong>{l.name}</strong><small>${l.symbol} · {ago(l.createdAt)}</small></span><ArrowUpRight size={18}/></button>)}</div>:<Empty icon={<Rocket/>} heading="No tokens yet" body="Tokens launched by your wallet through this Orbit instance will appear here." action={<button className="button green-button" onClick={()=>navigate('create')}>Create token</button>}/>}</>:<Empty icon={<Wallet/>} heading="Connect wallet" body="Connect a wallet to see the tokens created by its public address." action={<WalletMultiButton/>}/>}</div>}
+ function MenuPage(){const nav=[{page:'discover' as Page,text:'Explore tokens',icon:<Compass/>},{page:'leaderboard' as Page,text:'Leaderboard',icon:<Trophy/>},{page:'live' as Page,text:'Live',icon:<Radio/>},{page:'rewards' as Page,text:'Rewards',icon:<Coins/>},{page:'create' as Page,text:'Create token',icon:<Plus/>}];return <div className="menu-page"><div className="page-heading"><small className="eyebrow">ORBIT</small><h1>Menu</h1></div><div className="menu-links">{nav.map(n=><button key={n.page} onClick={()=>navigate(n.page)}>{n.icon}{n.text}<ArrowUpRight size={16}/></button>)}</div></div>}
+diff -ru '--exclude=.orbit-backups' '--exclude=ИНСТРУКЦИЯ_RU.md' orbit-solana-launchpad-en/web/src/api.ts orbit-testpatch/web/src/api.ts
+--- orbit-solana-launchpad-en/web/src/api.ts	2026-10-28 02:51:05.676486544 +0000
++++ orbit-testpatch/web/src/api.ts	2026-10-28 03:36:28.751965365 +0000
+@@ -1,4 +1,4 @@
+-export type AppConfig={network:'devnet'|'mainnet-beta';rpc:string;publicBase:string;tradeEnabled:boolean;raydiumProgramAllowlisted:boolean};
++export type AppConfig={network:'devnet'|'mainnet-beta';rpc:string;publicBase:string;tradeEnabled:boolean;mainnetTradingEnabled:boolean;launchEnabled:boolean;launchBlockReason:string;raydiumProgramAllowlisted:boolean};
+ export type Launch={mint:string;poolId:string;creator:string;programId:string;txSignature:string;metadataId:string;network:string;name:string;symbol:string;image:string;description:string;createdAt:string;verified:boolean;confidence:string};
+ export const SOL='So11111111111111111111111111111111111111112';
+ export async function callApi<T=any>(path:string,options?:RequestInit):Promise<T>{
+diff -ru '--exclude=.orbit-backups' '--exclude=ИНСТРУКЦИЯ_RU.md' orbit-solana-launchpad-en/web/src/chain.ts orbit-testpatch/web/src/chain.ts
+--- orbit-solana-launchpad-en/web/src/chain.ts	2026-10-28 02:51:05.676105795 +0000
++++ orbit-testpatch/web/src/chain.ts	2026-10-28 03:36:28.752194437 +0000
+@@ -25,6 +25,7 @@
+ }
+ export async function launchToken(connection:Connection,config:AppConfig,wallet:WalletContextState,input:{name:string;symbol:string;uri:string}){
+  if(!wallet.publicKey||!wallet.signAllTransactions)throw new Error('Connect a wallet that supports transaction signing');
++ if(!config.launchEnabled)throw new Error(config.launchBlockReason||'Token creation is currently disabled');
+  const raydium=await sdk(connection,config,wallet);
+  const programId=program(config);const mint=Keypair.generate();
+  const configId=getPdaLaunchpadConfigId(programId,NATIVE_MINT,0,0).publicKey;
+@@ -43,6 +44,7 @@
+ }
+ export async function curveTrade(connection:Connection,config:AppConfig,wallet:WalletContextState,item:Launch,side:'buy'|'sell',amount:string,slippageBps:number){
+  if(!wallet.publicKey||!wallet.signAllTransactions)throw new Error('Connect wallet');
++ if(config.network==='mainnet-beta'&&!config.mainnetTradingEnabled)throw new Error('Mainnet trading is disabled until reviewed');
+  if(slippageBps<10||slippageBps>500)throw new Error('Allowed slippage: 0.1% to 5%');
+  const raydium=await sdk(connection,config,wallet);const mintA=new PublicKey(item.mint),programId=new PublicKey(item.programId);
+  const p=await raydium.launchpad.getRpcPoolInfo({poolId:new PublicKey(item.poolId)});

@@ -55,3 +55,22 @@ test('Launch readiness is explicit and boolean for UI safety checks',async()=>{
   assert.equal(config.launchEnabled && config.network==='mainnet-beta',false);
  }finally{await new Promise(resolve=>server.close(resolve))}
 });
+
+test('Live network preflight fails closed for an unconfigured program without contacting RPC',async()=>{
+ const old=process.env.RAYDIUM_PROGRAM_ID;
+ process.env.RAYDIUM_PROGRAM_ID='invalid';
+ const server=makeServer();await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+ try{
+  const res=await fetch(`http://127.0.0.1:${server.address().port}/api/network-status`);
+  assert.equal(res.status,200);
+  const body=await res.json();
+  assert.equal(body.ready,false);
+  assert.equal(body.rpcReachable,false);
+  assert.equal(body.programDeployed,false);
+  assert.match(body.reason,/RAYDIUM_PROGRAM_ID/);
+ }finally{
+  await new Promise(resolve=>server.close(resolve));
+  if(old===undefined)delete process.env.RAYDIUM_PROGRAM_ID;
+  else process.env.RAYDIUM_PROGRAM_ID=old;
+ }
+});

@@ -1,0 +1,13 @@
+You are working inside my EXISTING Replit project that is connected to GitHub repository 16usa/ORBIT-Solana-Launchpad.
+
+I attached ORBIT-devnet-hardening-patch.zip. Extract this patch to the current Replit workspace and run `python3 orbit-audit-devnet-patch/apply_orbit_patch.py` from the workspace root.
+
+Do not create a new application. Do not touch any other repositories or projects. The patch applies to `artifacts/orbit-launchpad/original/orbit-solana-launchpad` and fixes launch safety, the local API proxy, and frontend readiness messages.
+
+Run these checks after applying:
+- pnpm --filter @workspace/orbit-launchpad run test
+- pnpm --filter @workspace/orbit-launchpad run check:syntax
+- pnpm --filter @workspace/orbit-launchpad run typecheck
+- pnpm --filter @workspace/orbit-launchpad run build
+
+If they pass, commit and push only the intended source changes to my existing GitHub repository (do not commit backup directories, ZIP files or secrets). Report exact results and any failures. Do not automatically restart processes, publish a deployment, or enable Solana mainnet. Do not claim that on-chain minting and trading work until tested with Devnet wallets.

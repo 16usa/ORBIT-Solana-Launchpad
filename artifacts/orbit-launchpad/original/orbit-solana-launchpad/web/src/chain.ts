@@ -19,18 +19,30 @@ export async function getPool(connection:Connection,config:AppConfig,mint:string
  const id=new PublicKey(programAddress||program(config).toBase58());const mintA=new PublicKey(mint);
  const poolId=getPdaLaunchpadPoolId(id,mintA,NATIVE_MINT).publicKey;
  const p=await raydium.launchpad.getRpcPoolInfo({poolId});
- const price=Curve.getPrice({poolInfo:p,curveType:p.configInfo.curveType,decimalA:p.mintDecimalsA,decimalB:p.mintDecimalsB});
+ const status=Number(p.status); // 0 funding, 1 waiting for migration, 2 migrated.
+ // A graduated token no longer has an executable curve price. Never present stale curve data as a live quote.
+ const price=status===0 ? Number(Curve.getPrice({poolInfo:p,curveType:p.configInfo.curveType,decimalA:p.mintDecimalsA,decimalB:p.mintDecimalsB}).toString()) : 0;
  const raisedSol=Number(p.realB.toString())/1e9,targetSol=Number(p.totalFundRaisingB.toString())/1e9;
- return {priceSol:Number(price.toString()),raisedSol,targetSol,progress:targetSol>0?Math.max(0,Math.min(100,raisedSol/targetSol*100)):0,status:Number(p.status),poolId:poolId.toBase58(),decimals:p.mintDecimalsA,updated:Date.now()};
+ return {priceSol:price,raisedSol,targetSol,progress:targetSol>0?Math.max(0,Math.min(100,raisedSol/targetSol*100)):0,status,poolId:poolId.toBase58(),decimals:p.mintDecimalsA,updated:Date.now()};
+}
+export async function verifyLaunchConfig(connection:Connection,config:AppConfig){
+ if(!config.launchEnabled)throw new Error(config.launchBlockReason||'Token creation is disabled');
+ const programId=program(config);
+ const selected=import.meta.env.VITE_RAYDIUM_LAUNCH_CONFIG_ID;
+ const configId=selected?new PublicKey(selected):getPdaLaunchpadConfigId(programId,NATIVE_MINT,0,0).publicKey;
+ const cfg=await connection.getAccountInfo(configId,'confirmed');
+ if(!cfg)throw new Error('LaunchLab config '+configId.toBase58()+' is unavailable on '+config.network+'. Set VITE_RAYDIUM_LAUNCH_CONFIG_ID to a verified SOL config.');
+ if(!cfg.owner.equals(programId))throw new Error('The configured LaunchLab account is not owned by the expected Raydium program');
+ const configInfo=LaunchpadConfig.decode(cfg.data);
+ if(!configInfo.mintB.equals(NATIVE_MINT))throw new Error('This LaunchLab config does not use SOL. ORBIT currently supports SOL launches only.');
+ return {configId,configInfo};
 }
 export async function launchToken(connection:Connection,config:AppConfig,wallet:WalletContextState,input:{name:string;symbol:string;uri:string}){
  if(!wallet.publicKey||!wallet.signAllTransactions)throw new Error('Connect a wallet that supports transaction signing');
  if(!config.launchEnabled)throw new Error(config.launchBlockReason||'Token creation is currently disabled');
  const raydium=await sdk(connection,config,wallet);
  const programId=program(config);const mint=Keypair.generate();
- const configId=getPdaLaunchpadConfigId(programId,NATIVE_MINT,0,0).publicKey;
- const cfg=await connection.getAccountInfo(configId,'confirmed');if(!cfg)throw new Error('Raydium LaunchLab configuration is unavailable on this network. Do not submit a transaction.');
- const configInfo=LaunchpadConfig.decode(cfg.data);
+ const {configId,configInfo}=await verifyLaunchConfig(connection,config);
  const quoteInfo=await raydium.token.getTokenInfo(configInfo.mintB);
  const {execute,extInfo}=await raydium.launchpad.createLaunchpad({
   programId,mintA:mint.publicKey,name:input.name,symbol:input.symbol,uri:input.uri,
@@ -46,14 +58,24 @@ export async function curveTrade(connection:Connection,config:AppConfig,wallet:W
  if(!wallet.publicKey||!wallet.signAllTransactions)throw new Error('Connect wallet');
  if(config.network==='mainnet-beta'&&!config.mainnetTradingEnabled)throw new Error('Mainnet trading is disabled until reviewed');
  if(slippageBps<10||slippageBps>500)throw new Error('Allowed slippage: 0.1% to 5%');
- const raydium=await sdk(connection,config,wallet);const mintA=new PublicKey(item.mint),programId=new PublicKey(item.programId);
- const p=await raydium.launchpad.getRpcPoolInfo({poolId:new PublicKey(item.poolId)});
- const platformData=await connection.getAccountInfo(p.platformId,'confirmed');if(!platformData)throw new Error('Platform fee configuration not found');
+ if(item.network!==config.network)throw new Error('Token network does not match the connected Solana network');
+ const mintA=new PublicKey(item.mint),programId=new PublicKey(item.programId);
+ if(!programId.equals(program(config)))throw new Error('This token belongs to a different launch program');
+ const expectedPool=getPdaLaunchpadPoolId(programId,mintA,NATIVE_MINT).publicKey;
+ if(!expectedPool.equals(new PublicKey(item.poolId)))throw new Error('Pool address does not match the canonical token PDA');
+ const raydium=await sdk(connection,config,wallet);
+ const p=await raydium.launchpad.getRpcPoolInfo({poolId:expectedPool});
+ if(Number(p.status)!==0)throw new Error('Bonding curve is closed. Wait for migration or use a supported swap route.');
+ if(!p.mintA.equals(mintA)||!p.mintB.equals(NATIVE_MINT))throw new Error('Live pool mints do not match the requested token/SOL pair');
+ if(p.mintDecimalsB!==9)throw new Error('Unexpected SOL decimals in pool');
+ const platformData=await connection.getAccountInfo(p.platformId,'confirmed');
+ if(!platformData)throw new Error('Platform fee configuration not found');
+ if(!platformData.owner.equals(programId))throw new Error('Platform config owner does not match the launch program');
  const platformInfo=PlatformConfig.decode(platformData.data);
  const mintInfo=await raydium.token.getTokenInfo(mintA);
  const mintBInfo=await raydium.token.getTokenInfo(p.mintB);
  if(side==='buy'){
-  const {execute}=await raydium.launchpad.buyToken({programId,mintA,mintAProgram:new PublicKey(mintInfo.programId),mintB:p.mintB,mintBProgram:new PublicKey(mintBInfo.programId),poolInfo:p,configInfo:p.configInfo,platformFeeRate:platformInfo.feeRate,buyAmount:new BN(amountBaseUnits(amount,9)),slippage:new BN(slippageBps),txVersion:TxVersion.V0} as any);
+  const {execute}=await raydium.launchpad.buyToken({programId,mintA,mintAProgram:new PublicKey(mintInfo.programId),mintB:p.mintB,mintBProgram:new PublicKey(mintBInfo.programId),poolInfo:p,configInfo:p.configInfo,platformFeeRate:platformInfo.feeRate,buyAmount:new BN(amountBaseUnits(amount,p.mintDecimalsB)),slippage:new BN(slippageBps),txVersion:TxVersion.V0} as any);
   return (await execute({sendAndConfirm:true})).txId;
  }
  const {execute}=await raydium.launchpad.sellToken({programId,mintA,mintAProgram:new PublicKey(mintInfo.programId),mintB:p.mintB,mintBProgram:new PublicKey(mintBInfo.programId),poolInfo:p,configInfo:p.configInfo,platformFeeRate:platformInfo.feeRate,sellAmount:new BN(amountBaseUnits(amount,p.mintDecimalsA)),slippage:new BN(slippageBps),txVersion:TxVersion.V0} as any);
