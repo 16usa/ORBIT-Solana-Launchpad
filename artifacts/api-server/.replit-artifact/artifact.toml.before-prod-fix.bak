@@ -1,0 +1,40 @@
+kind = "api"
+previewPath = "/api" # TODO - should be excluded from preview in the first place
+title = "ORBIT API"
+version = "1.0.0"
+id = "3B4_FFSkEVBkAeYMFRJ2e"
+
+[[services]]
+localPort = 8080
+name = "API Server"
+paths = ["/api", "/media", "/metadata"]
+
+[services.development]
+run = "node ../orbit-launchpad/original/orbit-solana-launchpad/server/app.mjs"
+
+[services.production]
+
+[services.production.build]
+args = ["node", "artifacts/api-server/build-orbit-api.mjs"]
+
+[services.production.build.env]
+NODE_ENV = "production"
+
+[services.production.run]
+args = ["node", "artifacts/api-server/dist/orbit-api/server/app.mjs"]
+
+[services.production.run.env]
+PORT = "8080"
+NODE_ENV = "production"
+
+SOLANA_CLUSTER = "devnet"
+RPC_URL = "https://api.devnet.solana.com"
+VITE_RPC_URL = "https://api.devnet.solana.com"
+PUBLIC_BASE_URL = "https://orbit-solana-launchpad.replit.app"
+RAYDIUM_PROGRAM_ID = "DRay6fNdQ5J82H7xV6uq2aV3mNrUZ1J4PgSKsWgptcm6"
+ENABLE_MAINNET_TRADING = "false"
+[services.production.health.startup]
+path = "/api/health"
+
+[services.env]
+PORT = "8080"

@@ -27,6 +27,12 @@ args = ["node", "artifacts/api-server/dist/orbit-api/server/app.mjs"]
 PORT = "8080"
 NODE_ENV = "production"
 
+SOLANA_CLUSTER = "devnet"
+RPC_URL = "https://api.devnet.solana.com"
+VITE_RPC_URL = "https://api.devnet.solana.com"
+PUBLIC_BASE_URL = "https://orbit-solana-launchpad.replit.app"
+RAYDIUM_PROGRAM_ID = "DRay6fNdQ5J82H7xV6uq2aV3mNrUZ1J4PgSKsWgptcm6"
+ENABLE_MAINNET_TRADING = "false"
 [services.production.health.startup]
 path = "/api/health"
 
