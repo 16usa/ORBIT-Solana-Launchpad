@@ -1,5 +1,5 @@
 import BN from 'bn.js';
-import {Keypair,PublicKey,VersionedTransaction} from '@solana/web3.js';
+import {Keypair,PublicKey,VersionedTransaction,Transaction,TransactionMessage,SystemProgram} from '@solana/web3.js';
 import {NATIVE_MINT,TOKEN_PROGRAM_ID} from '@solana/spl-token';
 import {Raydium,TxVersion,LAUNCHPAD_PROGRAM,DEVNET_PROGRAM_ID,LaunchpadConfig,PlatformConfig,Curve,getPdaLaunchpadConfigId,getPdaLaunchpadPoolId} from '@raydium-io/raydium-sdk-v2';
 import type {Connection} from '@solana/web3.js';
@@ -12,7 +12,19 @@ const program=(config:AppConfig)=>config.network==='devnet'?DEVNET_PROGRAM_ID.LA
 const cluster=(config:AppConfig)=>config.network==='devnet'?'devnet':'mainnet';
 async function sdk(connection:Connection,config:AppConfig,wallet?:WalletContextState){
  const owner=wallet?.publicKey||Keypair.generate().publicKey;
- return Raydium.load({owner,connection,cluster:cluster(config) as any,signAllTransactions:wallet?.signAllTransactions?.bind(wallet),disableFeatureCheck:true,disableLoadToken:true,blockhashCommitment:'confirmed'});
+ // ORBIT_STAGE7_MOBILE_SIGNING
+ // Mobile wallet injection can support signTransaction without reliably
+ // supporting signAllTransactions. Use one explicit signature request per
+ // transaction on mobile; never retry a failed signing request automatically.
+ const mobile=typeof navigator!=='undefined' && /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+ const signAll=mobile && wallet?.signTransaction
+  ? async <T extends Transaction|VersionedTransaction>(txs:T[]):Promise<T[]>=>{
+     const signed:T[]=[];
+     for(const tx of txs){signed.push(await wallet.signTransaction!(tx));}
+     return signed;
+    }
+  : wallet?.signAllTransactions?.bind(wallet);
+ return Raydium.load({owner,connection,cluster:cluster(config) as any,signAllTransactions:signAll,disableFeatureCheck:true,disableLoadToken:true,blockhashCommitment:'confirmed'});
 }
 export async function getPool(connection:Connection,config:AppConfig,mint:string,programAddress?:string):Promise<PoolView>{
  const raydium=await sdk(connection,config);
@@ -37,20 +49,183 @@ export async function verifyLaunchConfig(connection:Connection,config:AppConfig)
  if(!configInfo.mintB.equals(NATIVE_MINT))throw new Error('This LaunchLab config does not use SOL. ORBIT currently supports SOL launches only.');
  return {configId,configInfo};
 }
+// ORBIT_STAGE4_PLATFORM_PREFLIGHT
+// Raydium SDK defaults to the MAINNET platform unless platformId is supplied.
+// On Devnet use the SDK's Devnet platform constant; allow an explicitly
+// configured Devnet platform only when its on-chain account validates.
+// This read-only check never creates accounts or sends transactions.
+export async function requireLaunchPlatform(
+ connection:Connection, config:AppConfig, walletKey:PublicKey|null|undefined
+):Promise<PublicKey>{
+ if(config.network!=='devnet')throw new Error('ORBIT token creation is restricted to Devnet; Mainnet launch remains disabled.');
+ const programId=program(config);
+ const override=String(import.meta.env.VITE_RAYDIUM_PLATFORM_ID||'').trim();
+ let platformId:PublicKey;
+ try{platformId=override?new PublicKey(override):DEVNET_PROGRAM_ID.LAUNCHPAD_PLATFORM}
+ catch{throw new Error('Configured VITE_RAYDIUM_PLATFORM_ID is not a valid Solana address.');}
+ const info=await connection.getAccountInfo(platformId,'confirmed');
+ if(!info){
+  const help=override?'Your configured VITE_RAYDIUM_PLATFORM_ID':'Raydium SDK Devnet LAUNCHPAD_PLATFORM';
+  throw new Error(`${help} ${platformId.toBase58()} does not exist on Solana Devnet. Create/choose a verified Devnet PlatformConfig before launching; ORBIT will not fall back to the mainnet address.`);
+ }
+ if(!info.owner.equals(programId))throw new Error(`PlatformConfig ${platformId.toBase58()} is owned by ${info.owner.toBase58()}, not the Devnet LaunchLab program ${programId.toBase58()}.`);
+ try{PlatformConfig.decode(info.data)}catch{throw new Error('The selected Devnet PlatformConfig could not be decoded by Raydium SDK.');}
+ return platformId;
+}
+
+// A wallet-only diagnostic. An unsigned 0-lamport, self-directed transfer
+// is created locally, but is NEVER broadcast. The wallet must still approve
+// signing. This diagnostic cannot create a token or charge any network fee.
+export async function checkWalletSigning(connection:Connection,config:AppConfig,wallet:WalletContextState):Promise<void>{
+ if(config.network!=='devnet')throw new Error('The signature test is restricted to Devnet.');
+ if(!wallet.publicKey||!wallet.signTransaction)throw new Error('The connected wallet does not support signing a single transaction.');
+ const block=await connection.getLatestBlockhash('confirmed');
+ const instruction=SystemProgram.transfer({fromPubkey:wallet.publicKey,toPubkey:wallet.publicKey,lamports:0});
+ const message=new TransactionMessage({payerKey:wallet.publicKey,recentBlockhash:block.blockhash,instructions:[instruction]}).compileToV0Message();
+ const tx=new VersionedTransaction(message);
+ const signed=await wallet.signTransaction(tx);
+ const sig=signed.signatures?.[0];
+ if(!sig||!sig.some(v=>v!==0))throw new Error('Wallet returned a transaction without the fee-payer signature.');
+ // Intentionally NO sendTransaction, sendRawTransaction, or execute() here.
+}
+
+// ORBIT_STAGE8_RAYDIUM_NO_BROADCAST
+// Constructs the actual Raydium CreateLaunchpad V0 transaction, preflights
+// the first transaction, and requests a wallet signature. No transaction is
+// submitted, no metadata is uploaded, and the generated test mint is discarded.
+// The URI is deliberately inert: this must NEVER be used for a real launch.
+export async function checkRaydiumLaunchSigning(
+ connection:Connection,config:AppConfig,wallet:WalletContextState
+):Promise<string>{
+ if(config.network!=='devnet')throw new Error('Raydium signing diagnostic is Devnet-only.');
+ if(!config.launchEnabled)throw new Error(config.launchBlockReason||'Devnet launch is unavailable.');
+ if(!wallet.publicKey||!wallet.signTransaction)throw new Error('Connect a wallet with signTransaction support.');
+ const platformId=await requireLaunchPlatform(connection,config,wallet.publicKey);
+ const {configId,configInfo}=await verifyLaunchConfig(connection,config);
+ const raydium=await sdk(connection,config,wallet);
+ const mint=Keypair.generate();
+ const quote=await raydium.token.getTokenInfo(configInfo.mintB);
+ const built=await raydium.launchpad.createLaunchpad({
+  programId:program(config),mintA:mint.publicKey,
+  name:'ORBIT Diagnostic Only',symbol:'ORBDIAG',
+  uri:'https://example.com/orbit-diagnostic-never-published.json',
+  decimals:6,migrateType:'cpmm',configId,configInfo,
+  mintBDecimals:quote.decimals,createOnly:true,
+  buyAmount:new BN(1000),slippage:new BN(100),
+  extraSigners:[mint],txVersion:TxVersion.V0,platformId
+ } as any);
+ if(!Array.isArray(built.transactions)||built.transactions.length===0)
+  throw new Error('Raydium SDK returned no launch transactions.');
+ // ORBIT_STAGE9_WALLET_FIRST_COSIGN
+ // Some mobile wallets reject partially-signed multi-signer transactions.
+ // Take ONLY the message from Raydium and start with zero signatures.
+ // Let Phantom sign the wallet slot, then sign the ephemeral mint locally.
+ // This is a diagnostic and is NEVER submitted to Solana.
+ const sdkTx=built.transactions[0];
+ if(!(sdkTx instanceof VersionedTransaction))
+  throw new Error('Expected a V0 launch transaction; Raydium returned another format.');
+ const sdkSignatures=sdkTx.signatures.filter(sig=>sig.some(b=>b!==0)).length;
+ const tx=new VersionedTransaction(sdkTx.message);
+ const n=tx.message.header.numRequiredSignatures;
+ const signers=tx.message.staticAccountKeys.slice(0,n);
+ const walletKey=wallet.publicKey;
+ if(!signers[0]?.equals(walletKey))
+  throw new Error('Raydium launch fee payer differs from the connected wallet.');
+ if(!signers.some(k=>k.equals(walletKey)))
+  throw new Error('Connected wallet is not listed as a required signer.');
+ const unrecognized=signers.filter(k=>!k.equals(walletKey)&&!k.equals(mint.publicKey));
+ if(unrecognized.length)
+  throw new Error('Raydium requires an unexpected signer: '+unrecognized.map(k=>k.toBase58()).join(', '));
+ // The new mint keypair is never sent to the wallet or server.
+ // Unlike Stage 8, do NOT pre-sign before Phantom sees the transaction.
+ const mintIndex=signers.findIndex(k=>k.equals(mint.publicKey));
+ if(mintIndex<0)throw new Error('The Raydium transaction does not request the new mint signature.');
+ const walletIndex=signers.findIndex(k=>k.equals(walletKey));
+ if(walletIndex<0)throw new Error('The connected wallet is not a signer.');
+ const bytes=tx.serialize().length;
+ if(bytes>1232)throw new Error('Raydium transaction is oversized ('+bytes+' bytes).');
+ const simulation=await connection.simulateTransaction(tx,{
+  sigVerify:false,replaceRecentBlockhash:true,commitment:'confirmed'
+ });
+ if(simulation.value.err){
+  const logs=(simulation.value.logs||[]).slice(-14).join(' | ');
+  throw new Error('Raydium first transaction simulation failed: '+JSON.stringify(simulation.value.err)+(logs?' | '+logs:''));
+ }
+ const expectedMessage=tx.message.serialize();
+ let signed:VersionedTransaction;
+ try{signed=await wallet.signTransaction(tx) as VersionedTransaction;}
+ catch(e){
+  const err=e as any;
+  throw new Error('Unsigned Raydium launch signing failed. Phantom may reject the launch instructions or multi-signer format (not just pre-signing). Required signers: '+n+'; transaction bytes: '+bytes+'; SDK supplied '+sdkSignatures+' signature(s). Wallet error: '+String(err?.name||'Error')+' — '+String(err?.message||e)+(err?.cause?.message?' | Cause: '+err.cause.message:''));
+ }
+ if(!(signed instanceof VersionedTransaction))
+  throw new Error('Wallet returned a different transaction type.');
+ const actualMessage=signed.message.serialize();
+ if(actualMessage.length!==expectedMessage.length||actualMessage.some((v,i)=>v!==expectedMessage[i]))
+  throw new Error('Wallet changed the Raydium message. The diagnostic refused to co-sign.');
+ const walletSig=signed.signatures?.[walletIndex]?.slice();
+ if(!walletSig||!walletSig.some(b=>b!==0))
+  throw new Error('Wallet did not sign its required signer slot.');
+ signed.sign([mint]); // Mint keypair co-signs AFTER wallet approval.
+ const mintSig=signed.signatures?.[mintIndex];
+ if(!mintSig||!mintSig.some(b=>b!==0))
+  throw new Error('Local mint signature was not added.');
+ if(signed.signatures[walletIndex].some((v,i)=>v!==walletSig[i]))
+  throw new Error('Local mint co-signing modified the wallet signature.');
+ // No execute, submit, send, registration, or metadata writes anywhere here.
+ return 'Raydium V0 transaction: BUILT ('+bytes+' bytes, '+n+' signers; '+built.transactions.length+' SDK transaction(s); SDK originally had '+sdkSignatures+' signature(s)). Simulation: PASSED. Unsigned Raydium message accepted by Phantom: PASSED. Local mint co-signature added afterward: PASSED. No transaction sent and no token created.';
+}
+
 export async function launchToken(connection:Connection,config:AppConfig,wallet:WalletContextState,input:{name:string;symbol:string;uri:string}){
  if(!wallet.publicKey||!wallet.signAllTransactions)throw new Error('Connect a wallet that supports transaction signing');
  if(!config.launchEnabled)throw new Error(config.launchBlockReason||'Token creation is currently disabled');
+ const platformId=await requireLaunchPlatform(connection,config,wallet.publicKey);
+ // ORBIT_STAGE6_SIGNING_PREFLIGHT: check wallet capability and test-SOL balance before constructing a transaction.
+ const versionSupport=wallet.wallet?.adapter?.supportedTransactionVersions;
+ if(versionSupport&&!versionSupport.has(0))throw new Error('The selected wallet cannot sign Solana version-0 transactions. Choose a wallet supporting version 0.');
+ const balance=await connection.getBalance(wallet.publicKey,'confirmed');
+ if(balance===0)throw new Error('This wallet has 0 SOL on Devnet. Fund it with test SOL, then retry. Do not use mainnet funds.');
  const raydium=await sdk(connection,config,wallet);
  const programId=program(config);const mint=Keypair.generate();
  const {configId,configInfo}=await verifyLaunchConfig(connection,config);
  const quoteInfo=await raydium.token.getTokenInfo(configInfo.mintB);
- const {execute,extInfo}=await raydium.launchpad.createLaunchpad({
+ const {execute,extInfo,transactions}=await raydium.launchpad.createLaunchpad({
   programId,mintA:mint.publicKey,name:input.name,symbol:input.symbol,uri:input.uri,
   decimals:6,migrateType:'cpmm',configId,configInfo,mintBDecimals:quoteInfo.decimals,
   createOnly:true,buyAmount:new BN(1000),slippage:new BN(100),extraSigners:[mint],txVersion:TxVersion.V0,
-  ...(import.meta.env.VITE_RAYDIUM_PLATFORM_ID?{platformId:new PublicKey(import.meta.env.VITE_RAYDIUM_PLATFORM_ID)}:{})
+  platformId
  } as any);
- const {txIds}=await execute({sequentially:true});
+ // Simulate the FIRST transaction only: later transactions may depend on it being confirmed.
+ // Preflight simulation is not a wallet signature and never broadcasts a transaction.
+ if(!Array.isArray(transactions)||transactions.length===0)throw new Error('Raydium did not build any launch transactions.');
+ const first=transactions[0];
+ if(first instanceof VersionedTransaction){
+  const payer=first.message.staticAccountKeys[0];
+  if(!payer?.equals(wallet.publicKey))throw new Error('Launch transaction fee payer differs from your connected wallet. Signing blocked.');
+  let simulated;
+  try{
+   simulated=await connection.simulateTransaction(first,{sigVerify:false,replaceRecentBlockhash:true,commitment:'confirmed'});
+  }catch(e){
+   throw new Error(`Devnet transaction preflight RPC failed: ${e instanceof Error?e.message:String(e)}`,{cause:e});
+  }
+  if(simulated.value.err){
+   const logs=(simulated.value.logs||[]).slice(-12).join(' | ');
+   throw new Error(`Devnet launch simulation failed BEFORE wallet approval: ${JSON.stringify(simulated.value.err)}${logs?' | Program logs: '+logs:''}`);
+  }
+ }
+ let txIds:string[];
+ try{
+  ({txIds}=await execute({sequentially:true}));
+ }catch(e){
+  const error=e as any;
+  const name=String(error?.name||'');
+  const message=String(error?.message||e);
+  if(name.includes('WalletSign')||message==='Unexpected error'){
+   const detail=String(error?.cause?.message||error?.reason||'');
+   throw new Error(`Phantom or the wallet adapter could not sign the Devnet launch transaction (${name||'wallet error'}: ${message}). Check that Phantom Testnet Mode is enabled for Solana Devnet, that the wallet has Devnet SOL, and that no previous launch was confirmed. Do not keep retrying without checking transaction activity.${detail?' Details: '+detail:''}`,{cause:e});
+  }
+  throw e;
+ }
  if(!Array.isArray(txIds)||!txIds.length)throw new Error('No confirmed creation transaction returned');
  return {mint:mint.publicKey.toBase58(),poolId:extInfo.address.poolId.toBase58(),programId:programId.toBase58(),txSignature:txIds.at(-1)!};
 }

@@ -3,7 +3,7 @@ import {useWallet,useConnection} from '@solana/wallet-adapter-react';
 import OrbitWalletButton from './OrbitWalletButton';
 import {Rocket,Search,Plus,Home,Compass,UserRound,MoreHorizontal,ArrowUpRight,ChevronDown,Grid2X2,Rows3,SlidersHorizontal,Wallet,BarChart3,TrendingUp,Copy,CheckCircle2,AlertTriangle,X,Menu,Trophy,Radio,Coins,RefreshCw,LoaderCircle,ExternalLink,ShieldCheck,Info,ArrowLeft,Upload,Clock,Share2} from 'lucide-react';
 import {AppConfig,Launch,NetworkStatus,callApi,postJson,shorten,ago} from './api';
-import {PoolView,getPool,verifyLaunchConfig,launchToken,curveTrade,migratedTrade} from './chain';
+import {PoolView,getPool,verifyLaunchConfig,launchToken,curveTrade,migratedTrade,requireLaunchPlatform,checkWalletSigning,checkRaydiumLaunchSigning} from './chain';
 import WalletSetup from './WalletProvider';
 import './styles.css';
 
@@ -48,28 +48,83 @@ function Creator({config,notify,onCreated}:{config:AppConfig;notify:(m:string)=>
    setRpcStatus({...status,reason:'SOL LaunchLab config verified: '+verified.configId.toBase58()});}
   catch(e){setRpcStatus({...status,ready:false,reason:(e as Error).message})}
  }catch(e){notify('RPC check failed: '+(e as Error).message)}finally{setChecking(false)}}
+ // ORBIT_STAGE5_LAUNCH_DIAGNOSTICS
+ const [launchError,setLaunchError]=useState('');
  const update=(k:string,v:string)=>setForm(p=>({...p,[k]:v}));
  const onFile=(f?:File)=>{if(!f)return;if(f.size>5_000_000){notify('Maximum image size is 5 MB');return}if(!['image/png','image/jpeg','image/gif','image/webp'].includes(f.type)){notify('Supported formats: PNG, JPG, GIF, and WebP');return}setFile(f);setImagePreview(URL.createObjectURL(f))};
  function uploadBase64(file:File):Promise<string>{return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(file)})}
+ // ORBIT_STAGE7_WALLET_TEST: no broadcast; requires a wallet approval.
+ async function testWalletSignature(){
+  if(busy)return;
+  setBusy(true);
+  setLaunchError('');
+  try{
+   await checkWalletSigning(connection,config,wallet);
+   setLaunchError('Wallet signature test: PASSED. Phantom signed a Devnet version-0 transaction locally. Nothing was sent to Solana. A failing launch may involve transaction-specific instructions or the Raydium SDK.');
+   notify('Wallet signature test passed. No transaction was sent.');
+  }catch(err){
+   const e=err as any;
+   setLaunchError(`Wallet signature test: FAILED (no transaction sent).\n${String(e?.name||'Error')}: ${String(e?.message||err)}\nIf this failed in a Replit browser, open ORBIT inside the official Phantom in-app browser and verify Testnet Mode is set to Solana Devnet.`);
+   notify('Wallet signature test failed. No transaction was sent.');
+  }finally{setBusy(false)}
+ }
+ // ORBIT_STAGE8_RAYDIUM_TEST_UI: builds and signs a real Raydium tx locally without sending it.
+ async function testRaydiumSigning(){
+  if(busy)return;
+  setBusy(true);setLaunchError('');
+  try{
+   const result=await checkRaydiumLaunchSigning(connection,config,wallet);
+   setLaunchError('Raydium launch signing test: PASSED.\n'+result);
+   notify('Raydium launch signing test passed. No transaction sent.');
+  }catch(err){
+   const e=err as any;
+   setLaunchError('Raydium launch signing test: FAILED (no transaction sent).\n'+String(e?.name||'Error')+': '+String(e?.message||err));
+   notify('Raydium launch test failed. No transaction sent.');
+  }finally{setBusy(false)}
+ }
  async function create(e:React.FormEvent){e.preventDefault();if(!wallet.publicKey){notify('Connect your wallet first');return}if(!file){notify('Upload a token image');return}if(!config.launchEnabled){notify(config.launchBlockReason||'Token creation is currently disabled');return}
- setBusy(true);setReceipt('');try{
+ setBusy(true);setReceipt('');setLaunchError('');let stage='Preparing launch';try{
+  stage='Checking Solana Devnet';
   const network=await callApi<NetworkStatus>('/api/network-status');setRpcStatus(network);
   if(!network.ready)throw new Error(network.reason||'Devnet RPC or Raydium program is not ready');
   await verifyLaunchConfig(connection,config);
+  // Fail before uploading metadata when the wallet has no Devnet platform config.
+  stage='Verifying Raydium PlatformConfig';
+  await requireLaunchPlatform(connection,config,wallet.publicKey);
+  stage='Uploading token image';
   const uploaded=await postJson<{id:string}>('/api/media',{base64:await uploadBase64(file)});
+  stage='Preparing token metadata';
   const meta=await postJson<{id:string;uri:string}>('/api/metadata',{...form,imageId:uploaded.id});
+  stage='Building, signing or confirming Raydium launch';
   const tx=await launchToken(connection,config,wallet,{name:form.name.trim(),symbol:form.symbol.trim().toUpperCase(),uri:meta.uri});
   setReceipt(tx.mint);
   // A confirmed on-chain launch must not be lost if off-chain indexing fails.
   const pending={...tx,metadataId:meta.id,creator:wallet.publicKey.toBase58()};localStorage.setItem('orbit:pending-launch',JSON.stringify(pending));
+  stage='Registering confirmed on-chain token';
   await postJson('/api/launches',pending);localStorage.removeItem('orbit:pending-launch');
   notify('Token created! The blockchain transaction is confirmed.');onCreated();navigate('token',tx.mint);
- }catch(err){notify((err as Error).message)}finally{setBusy(false)} }
+ }catch(err){
+  const problem=err as any;
+  const cause=problem?.cause;
+  const logs=Array.isArray(problem?.logs)?problem.logs:[];
+  const text=[
+   `Step: ${stage}`,
+   `Error: ${String(problem?.name||'Unknown')}`,
+   `Message: ${String(problem?.message||err)}`,
+   cause?`Cause: ${String(cause?.message||cause)}`:'',
+   problem?.reason?`Reason: ${String(problem.reason)}`:'',
+   problem?.signature?`Transaction signature: ${String(problem.signature)}`:'',
+   logs.length?`Logs: ${logs.slice(0,20).join('\n')}`:'',
+  ].filter(Boolean).join('\n');
+  console.error('[ORBIT Devnet launch error]',stage,err);
+  setLaunchError(text.slice(0,3500));
+  notify(String(problem?.message||'Token creation failed'));
+ }finally{setBusy(false)} }
  return <div className="create-wrap"><div className="create-header"><button className="back-link" onClick={()=>navigate('discover')}><ArrowLeft size={17}/> Back</button><h1>Create a new token</h1><p>The token and bonding curve are created on Solana through Raydium LaunchLab. You must approve each transaction in your wallet.</p></div>
  <form onSubmit={create} className="form-layout"><div className="form-main"><div className="panel"><div className="panel-label">Token details</div><p className="micro-note">The token name and ticker cannot be changed after creation.</p><label>Token name <input required maxLength={32} minLength={2} placeholder="Name your coin" value={form.name} onChange={e=>update('name',e.target.value)}/></label><label>Ticker <input required maxLength={10} minLength={2} pattern="[a-zA-Z0-9_]+" placeholder="e.g., ORB" value={form.symbol} onChange={e=>update('symbol',e.target.value)}/></label><label>Description (optional) <textarea maxLength={800} rows={4} placeholder="What is your project about?" value={form.description} onChange={e=>update('description',e.target.value)}/></label><button type="button" className="text-toggle" onClick={()=>setAdvanced(!advanced)}>Add social links <ChevronDown size={15} style={{transform:advanced?'rotate(180deg)':undefined}}/></button>{advanced&&<div className="socials">{(['website','twitter','telegram'] as const).map(k=><label key={k}>{k==='website'?'Website':k==='twitter'?'X / Twitter':'Telegram'} <input type="url" placeholder="https://..." value={form[k]} onChange={e=>update(k,e.target.value)}/></label>)}</div>}<hr/><div className="panel-label">Liquidity asset</div><div className="sol-choice">≋ <strong>SOL</strong> <span>Raydium LaunchLab</span></div><p className="micro-note">The initial quote asset is SOL. The token launches on a bonding curve and may migrate to a Raydium pool when the protocol requirements are met.</p></div>
  <div className="panel"><div className="panel-label">Coin image</div><label className="drop-zone"><input type="file" accept="image/png,image/jpeg,image/gif,image/webp" onChange={e=>onFile(e.target.files?.[0])} hidden/>{imagePreview?<img className="file-preview" src={imagePreview} alt="Token preview"/>:<Upload size={33}/>}<strong>{file?file.name:'Select an image'}</strong><small>PNG, JPG, GIF, WebP · up to 5 MB</small></label></div></div>
- <aside className="form-side"><div className="panel sticky-panel"><div className="panel-label">Launch settings</div><div className="property"><span>Network</span><b>{config.network==='devnet'?'Solana Devnet':'Solana Mainnet'}</b></div><div className="property"><span>Protocol</span><b>Raydium LaunchLab</b></div><div className="property"><span>Type</span><b>Bonding curve</b></div><div className="property"><span>Initial buy</span><b>None</b></div><div className="property"><span>Fee</span><b>Set by the protocol</b></div><div className="property"><span>RPC / Program</span><b>{rpcStatus?(rpcStatus.ready?'Ready for config check': 'Unavailable'):'Not checked'}</b></div><button className="button full" type="button" onClick={checkRpc} disabled={checking}>{checking?'Checking network…':'Check Devnet connection'}</button>{rpcStatus&&<p className={rpcStatus.ready?'micro-note':'warning-text'}>{rpcStatus.reason}{rpcStatus.slot!==null?` · Slot ${rpcStatus.slot}`:''}</p>}<Banner>All network fees and transactions must be approved in your wallet. Private keys are never sent to the app.</Banner>{receipt&&<p className="success-receipt">Created token address: <code>{receipt}</code></p>}{!config.launchEnabled&&<p className="warning-text">{config.launchBlockReason}</p>}
- {wallet.publicKey?<button className="button green-button full" type="submit" disabled={busy||!config.launchEnabled}>{busy?<><LoaderCircle className="spin" size={18}/> Approve in your wallet…</>:<><Rocket size={17}/> Create token on Solana</>}</button>:<div className="center-wallet"><OrbitWalletButton showHint/></div>}
+ <aside className="form-side"><div className="panel sticky-panel"><div className="panel-label">Launch settings</div><div className="property"><span>Network</span><b>{config.network==='devnet'?'Solana Devnet':'Solana Mainnet'}</b></div><div className="property"><span>Protocol</span><b>Raydium LaunchLab</b></div><div className="property"><span>Type</span><b>Bonding curve</b></div><div className="property"><span>Initial buy</span><b>None</b></div><div className="property"><span>Fee</span><b>Set by the protocol</b></div><div className="property"><span>RPC / Program</span><b>{rpcStatus?(rpcStatus.ready?'Ready for config check': 'Unavailable'):'Not checked'}</b></div><button className="button full" type="button" onClick={checkRpc} disabled={checking}>{checking?'Checking network…':'Check Devnet connection'}</button>{rpcStatus&&<p className={rpcStatus.ready?'micro-note':'warning-text'}>{rpcStatus.reason}{rpcStatus.slot!==null?` · Slot ${rpcStatus.slot}`:''}</p>}<Banner>All network fees and transactions must be approved in your wallet. Private keys are never sent to the app.</Banner>{receipt&&<p className="success-receipt">Created token address: <code>{receipt}</code></p>}{launchError&&<div role="alert" className="warning-text" style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere',margin:'12px 0',fontSize:12}}><strong>Launch diagnostics</strong><br/>{launchError}<p style={{marginTop:10}}>If Phantom requested approval, check your Devnet transaction activity before attempting another launch.</p></div>}{!config.launchEnabled&&<p className="warning-text">{config.launchBlockReason}</p>}
+ {wallet.publicKey&&config.network==='devnet'&&<button className="button full" type="button" disabled={busy} onClick={testWalletSignature}>Test wallet signature (no broadcast)</button>}{wallet.publicKey&&config.network==='devnet'&&<button className="button full" type="button" disabled={busy} onClick={testRaydiumSigning}>Test Raydium wallet-first signature (no broadcast)</button>}{wallet.publicKey?<button className="button green-button full" type="submit" disabled={busy||!config.launchEnabled}>{busy?<><LoaderCircle className="spin" size={18}/> Approve in your wallet…</>:<><Rocket size={17}/> Create token on Solana</>}</button>:<div className="center-wallet"><OrbitWalletButton showHint/></div>}
  </div></aside></form></div>;
 }
 function TokenDetails({item,config,pool,graph,notify}:{item?:Launch;config:AppConfig;pool?:PoolView;graph:number[];notify:(m:string)=>void}){
