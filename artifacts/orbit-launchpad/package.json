@@ -87,6 +87,7 @@
     "zod": "catalog:"
   },
   "dependencies": {
+    "@privy-io/react-auth": "^3.51.0",
     "livekit-client": "2.23.0",
     "livekit-server-sdk": "2.19.2"
   }

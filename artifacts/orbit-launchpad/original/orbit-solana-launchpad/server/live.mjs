@@ -23,6 +23,11 @@ function safeTitle(input){return typeof input==='string'?input.trim().replace(/[
 function enabled(){return process.env.SOLANA_CLUSTER!=='mainnet-beta'&&/^wss:\/\/[^/]+/.test(process.env.LIVEKIT_URL||'')&&!!process.env.LIVEKIT_API_KEY&&!!process.env.LIVEKIT_API_SECRET}
 function publicLive(s){return {id:s.id,title:s.title,creator:s.wallet,createdAt:s.createdAt}}
 const drafts=new Map();const streams=new Map();
+// ORBIT_STAGE24_LIVE_SESSION_LIFECYCLE: 'active' becomes true only after Safari publishes camera/mic.
+// ORBIT_STAGE23_SAFARI_HANDOFF
+const handoffs=new Map(); // code SHA256 -> { wallet, title, expires }; RAM only, single-instance Devnet
+function handoffKey(code){return typeof code==='string'&&/^[a-f0-9]{64}$/.test(code)?sha(code).toString('hex'):'';}
+
 let sdk=null;async function clients(){
  if(!enabled())throw new Error('Live streaming is not configured. Set LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET on the API server.');
  sdk ||= await import('livekit-server-sdk');
@@ -33,14 +38,15 @@ let sdk=null;async function clients(){
 async function tokenFor(room,identity,publish){const {AccessToken}=await clients();const at=new AccessToken(process.env.LIVEKIT_API_KEY,process.env.LIVEKIT_API_SECRET,{identity,ttl:publish?'4h':'30m'});at.addGrant({roomJoin:true,room,canPublish:publish,canSubscribe:true,canPublishData:false});return at.toJwt()}
 function cleanup(){
  const t=Date.now();for(const [k,c] of drafts)if(c.until<t)drafts.delete(k);
- for(const [k,s] of streams)if(s.lastSeen && t-s.lastSeen>80_000 || !s.lastSeen && t-new Date(s.createdAt).getTime()>90_000)streams.delete(k);
+ for(const [k,c] of handoffs)if(c.expires<t)handoffs.delete(k);
+ for(const [k,s] of streams)if((s.lastSeen && t-s.lastSeen>80_000) || (!s.lastSeen && t-new Date(s.createdAt).getTime()>300_000))streams.delete(k);
 }
 export function makeLiveHandler({dataDir,json,error,readJson}){
  const reportsFile=path.join(dataDir,'live-reports.json');
  return async function handle(req,res,u){
   const p=u.pathname;
   cleanup();
-  if(p==='/api/live'&&req.method==='GET')return json(res,200,{enabled:enabled(),items:enabled()?[...streams.values()].filter(s=>s.lastSeen>0).map(publicLive):[],message:enabled()?'':'Configure LiveKit server credentials to enable live streaming.'});
+  if(p==='/api/live'&&req.method==='GET')return json(res,200,{enabled:enabled(),items:enabled()?[...streams.values()].filter(s=>s.lastSeen>0&&s.active===true).map(publicLive):[],message:enabled()?'':'Configure LiveKit server credentials to enable live streaming.'});
   if(p==='/api/live/challenge'&&req.method==='POST'){
    if(!enabled())return error(res,503,'Live streaming is not configured');
    const b=await readJson(req,900);
@@ -49,6 +55,36 @@ export function makeLiveHandler({dataDir,json,error,readJson}){
    const message=`ORBIT Live authorization\nNetwork: Solana Devnet\nWallet: ${b.wallet}\nAction: Start stream\nNonce: ${nonce}\nExpires: ${new Date(until).toISOString()}`;
    drafts.set(nonce,{wallet:b.wallet,message,until});if(drafts.size>500)drafts.clear();
    return json(res,200,{nonce,message});
+  }
+  // Stage 23: authorize with Phantom, but DO NOT start LiveKit or ask for media here.
+  // Code in the Safari URL is a short-lived, single-use bearer credential, not a wallet secret.
+  if(p==='/api/live/prepare'&&req.method==='POST'){
+   if(!enabled())return error(res,503,'Live streaming is not configured');
+   const b=await readJson(req,1400),c=drafts.get(b?.nonce);if(c)drafts.delete(b.nonce);
+   if(!c||c.until<Date.now()||c.wallet!==b.wallet||!verifySignature(c.wallet,c.message,b.signature))return error(res,403,'Wallet authorization failed. Sign a new Phantom challenge.');
+   const title=safeTitle(b.title);if(title.length<3)return error(res,400,'Stream title must be at least 3 characters');
+   if([...streams.values()].some(s=>s.wallet===c.wallet))return error(res,409,'This wallet already has an active stream');
+   if([...handoffs.values()].some(h=>h.wallet===c.wallet))return error(res,409,'A Safari handoff already exists for this wallet. Open the existing link or let it expire.');
+   if(handoffs.size>=40)return error(res,429,'Too many pending broadcasts');
+   const code=randomBytes(32).toString('hex'),expires=Date.now()+300_000;
+   handoffs.set(handoffKey(code),{wallet:c.wallet,title,expires});
+   res.setHeader('Cache-Control','no-store');
+   return json(res,201,{code,expiresAt:new Date(expires).toISOString()});
+  }
+  // Must be POST, not GET. URL previews and link scanners cannot start a stream.
+  if(p==='/api/live/redeem'&&req.method==='POST'){
+   if(!enabled())return error(res,503,'Live streaming is not configured');
+   const b=await readJson(req,500),key=handoffKey(b?.code);
+   const h=key&&handoffs.get(key);if(key)handoffs.delete(key); // atomic, single use
+   if(!h||h.expires<Date.now())return error(res,403,'This Safari handoff link is expired or already used. Return to Phantom for a fresh link.');
+   if([...streams.values()].some(s=>s.wallet===h.wallet))return error(res,409,'This wallet already has an active stream');
+   if(streams.size>=10)return error(res,429,'Maximum concurrent test streams reached');
+   const id=randomUUID(),room='orbit-live-'+id,adminKey=randomBytes(32).toString('hex');
+   const {service,url}=await clients();await service.createRoom({name:room,emptyTimeout:120,maxParticipants:120});
+   const token=await tokenFor(room,'host-'+id,true);
+   streams.set(id,{id,room,wallet:h.wallet,title:h.title,createdAt:new Date().toISOString(),lastSeen:0,secret:sha(adminKey)});
+   res.setHeader('Cache-Control','no-store');
+   return json(res,201,{stream:publicLive(streams.get(id)),url,token,adminKey});
   }
   if(p==='/api/live/start'&&req.method==='POST'){
    if(!enabled())return error(res,503,'Live streaming is not configured');
@@ -66,7 +102,7 @@ export function makeLiveHandler({dataDir,json,error,readJson}){
   if(p==='/api/live/heartbeat'&&req.method==='POST'){
    const b=await readJson(req,500),s=streams.get(b?.id);
    if(!s||!constantToken(b.adminKey,s.secret))return error(res,403,'Invalid session');
-   s.lastSeen=Date.now();return json(res,200,{ok:true});
+   s.lastSeen=Date.now();if(b.active===true)s.active=true;return json(res,200,{ok:true});
   }
   if(p==='/api/live/end'&&req.method==='POST'){
    const b=await readJson(req,500),s=streams.get(b?.id);
@@ -77,7 +113,7 @@ export function makeLiveHandler({dataDir,json,error,readJson}){
   }
   if(p==='/api/live/join'&&req.method==='POST'){
    const b=await readJson(req,400),s=streams.get(b?.id);
-   if(!s||!s.lastSeen)return error(res,404,'Stream is not live');
+   if(!s||!s.lastSeen||s.active!==true)return error(res,404,'Stream is not live');
    const token=await tokenFor(s.room,'viewer-'+randomUUID(),false);
    return json(res,200,{stream:publicLive(s),token,url:process.env.LIVEKIT_URL});
   }

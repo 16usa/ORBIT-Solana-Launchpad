@@ -16,8 +16,10 @@ function LivePlayer({session,onLeave}:{session:Session;onLeave:()=>void}){
  const [connected,setConnected]=useState(false),[camera,setCamera]=useState(true),[mic,setMic]=useState(true),[notice,setNotice]=useState('Connecting to live stream…');
  const [sound,setSound]=useState(false),[reportOpen,setReportOpen]=useState(false),[reason,setReason]=useState(''),[reportSent,setReportSent]=useState(false);
  const [busy,setBusy]=useState(false);
+ const [broadcasting,setBroadcasting]=useState(false);
+ const heartbeatRef=useRef<ReturnType<typeof setInterval>|null>(null);
  useEffect(()=>{
-  let disposed=false;let heartbeat:ReturnType<typeof setInterval>|undefined;
+  let disposed=false;
   const room=new Room({adaptiveStream:true,dynacast:true});roomRef.current=room;
   const clearElements=()=>{for(const box of [videoRef.current,audioRef.current]){if(box)box.replaceChildren()}};
   const attach=(track:RemoteTrack)=>{
@@ -35,15 +37,13 @@ function LivePlayer({session,onLeave}:{session:Session;onLeave:()=>void}){
     await room.connect(session.url,session.token,{autoSubscribe:true});
     if(disposed)return;
     if(publish){
-     if(!navigator.mediaDevices?.getUserMedia)throw new Error('This browser cannot use the camera or microphone. Open ORBIT in a compatible HTTPS browser.');
-     await room.localParticipant.setCameraEnabled(true,{facingMode:'user'});
-     await room.localParticipant.setMicrophoneEnabled(true);
+     // Safari media permission must be requested from an explicit button tap.
+     // Begin *private* keepalive now. The stream is not listed until camera/mic publish succeeds.
+     const keepalive=()=>postJson('/api/live/heartbeat',{id:session.stream.id,adminKey:session.adminKey}).catch(()=>setNotice('Studio disconnected from API. Return to Phantom for a fresh link if this persists.'));
+     await postJson('/api/live/heartbeat',{id:session.stream.id,adminKey:session.adminKey});
      if(disposed)return;
-     const localVideo=room.localParticipant.getTrackPublication(Track.Source.Camera)?.videoTrack;
-     if(localVideo&&videoRef.current){const el=localVideo.attach();if(el instanceof HTMLVideoElement){el.muted=true;el.playsInline=true;el.autoplay=true}videoRef.current.appendChild(el)}
-     const pulse=()=>postJson('/api/live/heartbeat',{id:session.stream.id,adminKey:session.adminKey}).catch(()=>setNotice('Server heartbeat failed — the stream may end.'));
-     await pulse();heartbeat=setInterval(pulse,15000);
-     setNotice('You are LIVE · Camera and microphone on');
+     heartbeatRef.current=setInterval(keepalive,15000);
+     setNotice('Studio connected. Tap Start camera & microphone to go live.');
     }else{
      for(const remote of room.remoteParticipants.values())for(const pub of remote.trackPublications.values())if(pub.track)attach(pub.track as RemoteTrack);
      setNotice('Watching live · Tap Enable sound if needed');
@@ -51,10 +51,26 @@ function LivePlayer({session,onLeave}:{session:Session;onLeave:()=>void}){
     setConnected(true);
    }catch(e){if(!disposed){setNotice(reportError(e));setConnected(false)}}
   })();
-  return ()=>{disposed=true;if(heartbeat)clearInterval(heartbeat);room.disconnect();roomRef.current=null;clearElements();
-   if(publish)postJson('/api/live/end',{id:session.stream.id,adminKey:session.adminKey}).catch(()=>{});
+  return ()=>{disposed=true;if(heartbeatRef.current){clearInterval(heartbeatRef.current);heartbeatRef.current=null;}room.disconnect();roomRef.current=null;clearElements();
+   // ORBIT_STAGE24_LIVE_SESSION_LIFECYCLE: only the explicit End stream button closes the server room.
+   // Component cleanup disconnects the local participant; the API removes abandoned streams after heartbeat expiry.
   };
  },[session,publish]);
+ const startCamera=async()=>{
+  if(!roomRef.current||broadcasting||busy)return;
+  if(!navigator.mediaDevices?.getUserMedia){setNotice('Camera and microphone require Safari on HTTPS. Open this link directly in Safari.');return;}
+  setBusy(true);
+  try{
+   const room=roomRef.current;
+   await room.localParticipant.setCameraEnabled(true,{facingMode:'user'});
+   await room.localParticipant.setMicrophoneEnabled(true);
+   const localVideo=room.localParticipant.getTrackPublication(Track.Source.Camera)?.videoTrack;
+   if(localVideo&&videoRef.current){videoRef.current.replaceChildren();const el=localVideo.attach();if(el instanceof HTMLVideoElement){el.muted=true;el.playsInline=true;el.autoplay=true;}videoRef.current.appendChild(el);}
+   await postJson('/api/live/heartbeat',{id:session.stream.id,adminKey:session.adminKey,active:true});
+   setCamera(true);setMic(true);setBroadcasting(true);setNotice('You are LIVE · Camera and microphone on');
+  }catch(e){setNotice(reportError(e));try{await roomRef.current?.localParticipant.setCameraEnabled(false);await roomRef.current?.localParticipant.setMicrophoneEnabled(false);}catch{}}
+  finally{setBusy(false)}
+ };
  const toggleCam=async()=>{try{const v=!camera;await roomRef.current?.localParticipant.setCameraEnabled(v);setCamera(v)}catch(e){setNotice(reportError(e))}};
  const toggleMic=async()=>{try{const v=!mic;await roomRef.current?.localParticipant.setMicrophoneEnabled(v);setMic(v)}catch(e){setNotice(reportError(e))}};
  const enableSound=async()=>{try{await roomRef.current?.startAudio();setSound(true)}catch(e){setNotice(reportError(e))}};
@@ -64,41 +80,62 @@ function LivePlayer({session,onLeave}:{session:Session;onLeave:()=>void}){
  const stop=async()=>{if(busy)return;setBusy(true);try{if(publish)await postJson('/api/live/end',{id:session.stream.id,adminKey:session.adminKey});}catch(e){setNotice(reportError(e))}onLeave()};
  return <div className="orbit-live-view">
   <div className="orbit-live-header"><div><span className="orbit-live-eyebrow">{publish?'YOUR BROADCAST':'LIVE NOW'}</span><h2>{session.stream.title}</h2><small>By {shorten(session.stream.creator,7)} · {publish?'Broadcaster':'Viewer'}</small></div><button className="orbit-live-close" onClick={stop} aria-label="Leave live stream"><X/></button></div>
-  <div className="orbit-live-stage"><div className="orbit-live-video" ref={videoRef}/><div className="orbit-live-audio" ref={audioRef}/><span className="orbit-live-pill">● LIVE</span>{!connected&&<div className="orbit-live-placeholder"><Video size={36}/><span>{notice}</span></div>}</div>
+  <div className="orbit-live-stage"><div className="orbit-live-video" ref={videoRef}/><div className="orbit-live-audio" ref={audioRef}/><span className="orbit-live-pill" style={{display:(!connected||(publish&&!broadcasting))?'none':undefined}}>● LIVE</span>{!connected&&<div className="orbit-live-placeholder"><Video size={36}/><span>{notice}</span></div>}</div>
   <div className="orbit-live-status" role="status">{notice}</div>
   <div className="orbit-live-controls">
-   {publish?<><button onClick={toggleCam} disabled={!connected}>{camera?<Camera/>:<VideoOff/>}{camera?'Camera on':'Camera off'}</button><button onClick={toggleMic} disabled={!connected}>{mic?<Mic/>:<MicOff/>}{mic?'Mic on':'Mic off'}</button></>:<button onClick={enableSound} disabled={!connected}>{sound?<Mic/>:<MicOff/>}{sound?'Sound enabled':'Enable sound'}</button>}
+   {publish&&!broadcasting?<button className="orbit-live-start" onClick={startCamera} disabled={!connected||busy}><Camera/> {busy?'Requesting permission…':'Start camera & microphone'}</button>:null}
+   {publish&&broadcasting?<><button onClick={toggleCam} disabled={!connected}>{camera?<Camera/>:<VideoOff/>}{camera?'Camera on':'Camera off'}</button><button onClick={toggleMic} disabled={!connected}>{mic?<Mic/>:<MicOff/>}{mic?'Mic on':'Mic off'}</button></>:!publish?<button onClick={enableSound} disabled={!connected}>{sound?<Mic/>:<MicOff/>}{sound?'Sound enabled':'Enable sound'}</button>:null}
    <button onClick={share}><Copy/>Share link</button>
    <button className={publish?'orbit-live-danger':''} onClick={stop}>{publish?'End stream':'Leave'}</button>
   </div>
   {!publish&&<div className="orbit-live-report"><button disabled={reportSent} onClick={()=>setReportOpen(!reportOpen)}><Flag size={16}/>{reportSent?'Report received':'Report stream'}</button>{reportOpen&&<div className="orbit-live-report-form"><textarea maxLength={140} placeholder="Why are you reporting this stream?" value={reason} onChange={e=>setReason(e.target.value)}/><button disabled={reason.trim().length<6} onClick={sendReport}>Send report</button></div>}</div>}
-  {publish&&<p className="orbit-live-tip"><ShieldAlert size={15}/> You are broadcasting live audio/video. Do not share private information. Closing this page ends your stream.</p>}
+  {publish&&<p className="orbit-live-tip"><ShieldAlert size={15}/> You are broadcasting live audio/video. Do not share private information. Leaving the page stops sending video; abandoned sessions expire automatically.</p>}
  </div>;
 }
 
 export default function OrbitLive({directRoom}:{directRoom:string}){
  const wallet=useWallet();const [list,setList]=useState<LiveList>({enabled:false,items:[]});const [title,setTitle]=useState('');
+ // ORBIT_STAGE23_SAFARI_HANDOFF
  const [session,setSession]=useState<Session|null>(null),[busy,setBusy]=useState(false),[error,setError]=useState('');
+ const [handoff,setHandoff]=useState<{url:string;expiresAt:string}|null>(null);
+ const redeemed=useRef(false);
+ const [copyNotice,setCopyNotice]=useState('');
  const load=useCallback(async()=>{try{const data=await callApi<LiveList>('/api/live');setList(data)}catch(e){setError(reportError(e))}},[]);
  useEffect(()=>{load();const timer=setInterval(load,10000);return()=>clearInterval(timer)},[load]);
  const join=useCallback(async(id:string)=>{setBusy(true);setError('');try{const result=await postJson<Session>('/api/live/join',{id});setSession(result);if(location.hash!==`#/live/${id}`)location.hash=`#/live/${id}`;}catch(e){setError(reportError(e));if(location.hash.startsWith('#/live/'))location.hash='#/live'}finally{setBusy(false)}},[]);
- useEffect(()=>{if(directRoom&&!session&&!busy)void join(directRoom)},[directRoom,session,join]);
+ useEffect(()=>{if(directRoom&&!directRoom.startsWith('host/')&&!session&&!busy)void join(directRoom)},[directRoom,session,join]);
+ const hostCode=directRoom.startsWith('host/')?directRoom.slice(5):'';
+ const redeem=async()=>{
+  if(!/^[a-f0-9]{64}$/.test(hostCode)||redeemed.current)return;
+  redeemed.current=true;setBusy(true);setError('');
+  try{
+   const result=await postJson<Session>('/api/live/redeem',{code:hostCode});
+   // Remove the bearer code from the Safari address bar immediately after redemption.
+   history.replaceState(null,'',location.pathname+location.search+'#/live');
+   setSession(result);
+  }catch(e){setError(reportError(e));history.replaceState(null,'',location.pathname+location.search+'#/live');}
+  finally{setBusy(false)}
+ };
+ const copyHandoff=async()=>{if(!handoff)return;try{await navigator.clipboard.writeText(handoff.url);setCopyNotice('Copied. Paste the link into Safari’s address bar.');}catch{setCopyNotice('Copy the link shown below, then paste it into Safari.')}};
+
  const start=async()=>{
   if(!wallet.publicKey||!wallet.signMessage){setError('Connect a Solana wallet that supports signMessage to go live.');return}
-  if(!navigator.mediaDevices?.getUserMedia){setError('Camera/microphone unavailable in this browser.');return}
   setBusy(true);setError('');
   try{
    const address=wallet.publicKey.toBase58();const challenge=await postJson<{nonce:string;message:string}>('/api/live/challenge',{wallet:address});
    const raw=await wallet.signMessage(new TextEncoder().encode(challenge.message));
    const signature=btoa(Array.from(raw,(v)=>String.fromCharCode(v)).join(''));
-   const result=await postJson<Session>('/api/live/start',{wallet:address,nonce:challenge.nonce,signature,title});
-   setSession(result);
+   const result=await postJson<{code:string;expiresAt:string}>('/api/live/prepare',{wallet:address,nonce:challenge.nonce,signature,title});
+   const url=new URL(location.href);url.hash=`#/live/host/${result.code}`;
+   setHandoff({url:url.toString(),expiresAt:result.expiresAt});
   }catch(e){setError(reportError(e))}finally{setBusy(false)}
  };
- const leave=()=>{setSession(null);location.hash='#/live';load()};
+ const leave=()=>{setSession(null);setHandoff(null);redeemed.current=false;location.hash='#/live';load()};
  return <section className="orbit-live-page">
   <div className="page-heading"><small className="eyebrow">ORBIT / COMMUNITY</small><h1>Live streams</h1></div>
   {session?<LivePlayer key={session.stream.id} session={session} onLeave={leave}/>:
+  hostCode?<div className="orbit-live-form"><h3><Camera/> Safari broadcast studio</h3><p>Your Phantom wallet has already authorized this session. Tap below to redeem your one-time link, then allow Safari to use your camera and microphone.</p><button className="orbit-live-start" disabled={busy||redeemed.current||!/^[a-f0-9]{64}$/.test(hostCode)} onClick={redeem}>{busy?'Opening studio…':'Open studio in Safari'}</button><p className="orbit-live-note">If the link has expired, return to ORBIT in Phantom and authorize a fresh one.</p></div>:
+  handoff?<div className="orbit-live-form"><h3><Camera/> Continue in Safari</h3><p>Phantom wallet authorization succeeded. Your stream has not started yet.</p><p>Copy this temporary, one-time link. Switch to the Safari app and paste it into the address bar. Then tap Open studio and Start camera & microphone.</p><button className="orbit-live-start" onClick={copyHandoff}><Copy/> Copy Safari link</button><p className="orbit-live-handoff-url">{handoff.url}</p>{copyNotice&&<p className="orbit-live-note" role="status">{copyNotice}</p>}<p className="orbit-live-note">Expires at {new Date(handoff.expiresAt).toLocaleTimeString()}. Anyone with this link can start your stream until it is used. Do not share it.</p></div>:
   <><div className="orbit-live-intro"><Radio size={21}/><span>Real-time video and audio. Anyone can watch; connected wallets can broadcast.</span></div>
   {!list.enabled?<div className="orbit-live-unavailable"><ShieldAlert size={24}/><h3>Live streaming needs a video server</h3><p>{list.message||'The server-side LiveKit connection is not configured.'}</p><p>Set LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET on the ORBIT API server. No simulated streams will be shown.</p></div>:
   <><div className="orbit-live-form"><h3><Video size={21}/> Start a live stream</h3><p>Broadcast from your camera and microphone. Phantom will ask for a message signature (not a transaction).</p><label htmlFor="orbit-live-title">Stream title</label><input id="orbit-live-title" type="text" maxLength={64} value={title} onChange={e=>setTitle(e.target.value)} placeholder="What are you streaming?"/>
