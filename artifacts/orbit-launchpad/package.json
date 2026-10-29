@@ -85,5 +85,9 @@
     "vite": "6.3.5",
     "wouter": "^3.3.5",
     "zod": "catalog:"
+  },
+  "dependencies": {
+    "livekit-client": "2.23.0",
+    "livekit-server-sdk": "2.19.2"
   }
 }

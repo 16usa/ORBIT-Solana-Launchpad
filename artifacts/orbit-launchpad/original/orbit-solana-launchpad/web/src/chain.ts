@@ -1,5 +1,6 @@
+import { Buffer } from 'buffer';
 import BN from 'bn.js';
-import {Keypair,PublicKey,VersionedTransaction,Transaction,TransactionMessage,SystemProgram} from '@solana/web3.js';
+import {Keypair,PublicKey,VersionedTransaction,Transaction,TransactionInstruction,TransactionMessage,SystemProgram} from '@solana/web3.js';
 import {NATIVE_MINT,TOKEN_PROGRAM_ID} from '@solana/spl-token';
 import {Raydium,TxVersion,LAUNCHPAD_PROGRAM,DEVNET_PROGRAM_ID,LaunchpadConfig,PlatformConfig,Curve,getPdaLaunchpadConfigId,getPdaLaunchpadPoolId} from '@raydium-io/raydium-sdk-v2';
 import type {Connection} from '@solana/web3.js';
@@ -177,113 +178,57 @@ export async function checkRaydiumLaunchSigning(
 }
 
 
-// ORBIT_STAGE10_VERIFIED_DEVNET_LAUNCH
-// Devnet only. No automatic retries or wallet-warning bypass.
-export async function launchToken(
- connection:Connection,
- config:AppConfig,
- wallet:WalletContextState,
- input:{name:string;symbol:string;uri:string}
-){
- if(config.network!=='devnet')
-  throw new Error('Mainnet launches are disabled');
-
- if(!config.launchEnabled)
-  throw new Error(config.launchBlockReason||'Launch unavailable');
-
- if(!wallet.publicKey||!wallet.signTransaction)
-  throw new Error('Connect a V0-compatible Solana wallet');
-
+// ORBIT_STAGE12_READONLY_AUDIT
+// Read-only LaunchLab transaction preflight. This diagnostic NEVER requests
+// wallet signatures, signs with ephemeral keys, submits transactions, or
+// uploads token metadata. A successful RPC simulation does NOT prove safety.
+export async function inspectRaydiumLaunch(
+ connection:Connection,config:AppConfig,wallet:WalletContextState
+):Promise<string>{
+ if(config.network!=='devnet'||!config.launchEnabled)
+  throw new Error('Read-only launch audit is available on enabled Devnet only.');
+ if(!wallet.publicKey)
+  throw new Error('Connect a dedicated Devnet wallet to run this audit.');
  const payer=wallet.publicKey;
- const support=wallet.wallet?.adapter?.supportedTransactionVersions;
-
- if(support&&!support.has(0))
-  throw new Error('Wallet does not support V0 transactions');
-
- if(await connection.getBalance(payer,'confirmed')===0)
-  throw new Error('Wallet has no Devnet SOL');
-
- const programId=program(config);
- const platformId=await requireLaunchPlatform(
-  connection,config,payer
- );
-
- const {configId,configInfo}=await verifyLaunchConfig(
-  connection,config
- );
-
+ const platformId=await requireLaunchPlatform(connection,config,payer);
+ const {configId,configInfo}=await verifyLaunchConfig(connection,config);
  const raydium=await sdk(connection,config,wallet);
- const mint=Keypair.generate();
  const quote=await raydium.token.getTokenInfo(configInfo.mintB);
-
+ const mint=Keypair.generate(); // Ephemeral only: never exported or broadcast.
  const built=await raydium.launchpad.createLaunchpad({
-  programId,
-  mintA:mint.publicKey,
-  name:input.name,
-  symbol:input.symbol,
-  uri:input.uri,
-  decimals:6,
-  migrateType:'cpmm',
-  configId,
-  configInfo,
-  mintBDecimals:quote.decimals,
-  createOnly:true,
-  buyAmount:new BN(1000),
-  slippage:new BN(100),
-  extraSigners:[mint],
-  txVersion:TxVersion.V0,
-  platformId
+  programId:program(config),mintA:mint.publicKey,
+  name:'ORBIT Readonly Check',symbol:'ORBAUDIT',
+  uri:'https://example.com/orbit-readonly-check-not-for-launch.json',
+  decimals:6,migrateType:'cpmm',configId,configInfo,
+  mintBDecimals:quote.decimals,createOnly:true,
+  buyAmount:new BN(1000),slippage:new BN(100),
+  extraSigners:[mint],txVersion:TxVersion.V0,platformId
  } as any);
-
- if(!Array.isArray(built.transactions)||
-    built.transactions.length!==1)
-  throw new Error(
-   'Expected one Raydium transaction. Signing blocked.'
-  );
-
+ if(!Array.isArray(built.transactions)||built.transactions.length!==1)
+  throw new Error('Expected one create-only Raydium transaction, received '+String(built.transactions?.length??'none')+'. No wallet prompt.');
  const original=built.transactions[0];
-
- if(!(original instanceof VersionedTransaction)||
-    original.message.version!==0)
-  throw new Error('Unsupported Raydium transaction format');
-
-
+ if(!(original instanceof VersionedTransaction)||original.message.version!==0)
+  throw new Error('Raydium did not return a V0 transaction.');
  const message=original.message;
- // ORBIT_STAGE11_ALT_RESOLUTION
- // Solana V0 Address Lookup Tables are valid. Resolve every referenced table
- // on the same Devnet RPC, then validate programs using ALL resolved keys.
- // Missing tables or program IDs not on the existing allowlist fail closed.
- const lookupTables=await Promise.all(
-  message.addressTableLookups.map(async lookup=>{
-   const result=await connection.getAddressLookupTable(
-    lookup.accountKey,{commitment:'confirmed'}
-   );
-   if(!result.value)
-    throw new Error('Missing Devnet address lookup table: '+lookup.accountKey.toBase58());
-   return result.value;
-  })
- );
- const resolvedKeys=message.getAccountKeys({addressLookupTableAccounts:lookupTables});
- for(const ix of message.compiledInstructions){
-  if(!resolvedKeys.get(ix.programIdIndex) ||
-     ix.accountKeyIndexes.some(i=>!resolvedKeys.get(i)))
-   throw new Error('Unresolved Devnet transaction account index; launch blocked');
- }
-
- const keys=message.staticAccountKeys;
-
- const signers=keys.slice(
-  0,message.header.numRequiredSignatures
- );
-
- if(signers.length!==2||
-    !signers[0].equals(payer)||
-    !signers[1].equals(mint.publicKey))
-  throw new Error('Unexpected transaction signers');
-
+ const signerKeys=message.staticAccountKeys.slice(0,message.header.numRequiredSignatures);
+ if(signerKeys.length!==2||!signerKeys[0].equals(payer)||!signerKeys[1].equals(mint.publicKey))
+  throw new Error('Unexpected signer roles in Raydium launch. No wallet prompt.');
+ const lookupTables=await Promise.all(message.addressTableLookups.map(async lookup=>{
+  const response=await connection.getAddressLookupTable(lookup.accountKey,{commitment:'confirmed'});
+  if(!response.value)throw new Error('Missing Devnet ALT '+lookup.accountKey.toBase58());
+  return response.value;
+ }));
+ const allKeys=message.getAccountKeys({addressLookupTableAccounts:lookupTables});
+ const instructions=message.compiledInstructions;
+ const calledPrograms=instructions.map(ix=>{
+  const id=allKeys.get(ix.programIdIndex);
+  if(!id||ix.accountKeyIndexes.some(i=>!allKeys.get(i)))
+   throw new Error('Unresolved account index in V0 transaction. No wallet prompt.');
+  return id.toBase58();
+ });
+ const uniquePrograms=[...new Set(calledPrograms)];
  const allowed=new Set([
-  programId.toBase58(),
-  SystemProgram.programId.toBase58(),
+  program(config).toBase58(),SystemProgram.programId.toBase58(),
   TOKEN_PROGRAM_ID.toBase58(),
   'TokenzQdBNbLqP5VEhdkAS6EPFZ6LKruL4y3Yz9KP',
   'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
@@ -291,102 +236,611 @@ export async function launchToken(
   'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
   'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'
  ]);
-
- const programs=message.compiledInstructions.map(
-  ix=>resolvedKeys.get(ix.programIdIndex)?.toBase58()
- );
-
- if(!programs.includes(programId.toBase58())||
-    programs.some(id=>!id||!allowed.has(id)))
-  throw new Error('Unreviewed program in launch transaction');
-
+ const unknown=uniquePrograms.filter(id=>!allowed.has(id));
  const bh=await connection.getLatestBlockhash('confirmed');
-
- const tx=new VersionedTransaction(message);
+ const tx=new VersionedTransaction(message); // Fresh, zeroed signature slots.
  tx.message.recentBlockhash=bh.blockhash;
-
- tx.sign([mint]);
-
- if(tx.serialize().length>1232)
-  throw new Error('Transaction exceeds Solana size limit');
-
- const sim=await connection.simulateTransaction(tx,{
-  sigVerify:false,
-  commitment:'confirmed'
- });
-
- if(sim.value.err)
-  throw new Error(
-   'Devnet simulation failed: '+
-   JSON.stringify(sim.value.err)+' | '+
-   (sim.value.logs||[]).slice(-15).join(' | ')
-  );
-
- const expected=tx.message.serialize();
- let signed:VersionedTransaction;
-
- try {
-  signed=await wallet.signTransaction(tx) as VersionedTransaction;
- } catch(e) {
-  throw new Error(
-   'Phantom rejected transaction. Do not bypass safety warnings. '+
-   String((e as Error).message||e)
-  );
- }
-
- if(!(signed instanceof VersionedTransaction))
-  throw new Error('Invalid signed transaction type');
-
- const actual=signed.message.serialize();
-
- if(actual.length!==expected.length||
-    actual.some((b,i)=>b!==expected[i]))
-  throw new Error('Wallet changed transaction message');
-
- if(signed.signatures.length!==2||
-    signed.signatures.some(sig=>!sig.some(b=>b!==0)))
-  throw new Error('Required signature missing');
-
- const signature=await connection.sendRawTransaction(
-  signed.serialize(),
-  {
-   skipPreflight:false,
-   preflightCommitment:'confirmed',
-   maxRetries:0
-  }
+ const byteSize=tx.serialize().length;
+ if(byteSize>1232)throw new Error('Raydium transaction exceeds 1232 bytes.');
+ const [genesis,balance,fee,programAccounts,simulation]=await Promise.all([
+  connection.getGenesisHash(),
+  connection.getBalance(payer,'confirmed'),
+  connection.getFeeForMessage(tx.message,'confirmed'),
+  connection.getMultipleAccountsInfo(uniquePrograms.map(id=>new PublicKey(id)),'confirmed'),
+  connection.simulateTransaction(tx,{
+   sigVerify:false,replaceRecentBlockhash:false,commitment:'confirmed',
+   accounts:{encoding:'base64',addresses:[payer.toBase58(),mint.publicKey.toBase58()]}
+  })
+ ]);
+ const executable=uniquePrograms.map((id,i)=>
+  id+' : '+(programAccounts[i]?.executable?'executable':programAccounts[i]?'not executable':'account missing')
  );
+ const payerAfter=simulation.value.accounts?.[0]?.lamports;
+ const spending=typeof payerAfter==='number'
+  ?Math.max(0,(balance-payerAfter)/1e9).toFixed(9)+' SOL (estimated from simulation)'
+  :'not available from RPC';
+ const logs=(simulation.value.logs||[]).slice(-25).join('\n');
+ const state=simulation.value.err?'FAILED '+JSON.stringify(simulation.value.err):'PASSED (unsigned preflight only)';
+ const report=[
+  'ORBIT Stage 12 - READ-ONLY Devnet launch audit',
+  'No wallet signature requested. No transaction sent. No token created.',
+  'This uses a temporary diagnostic mint/URI, not your actual token form.',
+  'RPC genesis hash: '+genesis,
+  'RPC simulation slot: '+simulation.context.slot,
+  'Wallet Devnet balance: '+(balance/1e9).toFixed(6)+' SOL',
+  'Simulated payer decrease: '+spending,
+  'Signature fee estimate: '+(fee.value===null?'unavailable':(fee.value/1e9).toFixed(9)+' SOL'),
+  'Transaction: '+byteSize+' bytes; '+instructions.length+' instructions; '+signerKeys.length+' signers; '+lookupTables.length+' lookup table(s)',
+  'LaunchLab program: '+program(config).toBase58(),
+  'Launch config: '+configId.toBase58(),
+  'Platform config: '+platformId.toBase58(),
+  'Program allowlist: '+(unknown.length?'UNREVIEWED '+unknown.join(', '):'all invoked programs recognized'),
+  'Invoked program accounts:\n'+executable.join('\n'),
+  'RPC simulation: '+state,
+  'Units consumed: '+String(simulation.value.unitsConsumed??'unavailable'),
+  'Last program logs:\n'+(logs||'(none)'),
+  'IMPORTANT: sigVerify=false checks execution only; it does NOT prove that a wallet will sign or that Phantom safety warnings are wrong.'
+ ];
+ return report.join('\n');
+}
 
- let confirmation;
-
- try {
-  confirmation=await connection.confirmTransaction(
-   {signature,...bh},
-   'confirmed'
-  );
- } catch(e) {
-  throw new Error(
-   'Submission status uncertain. Check Devnet transaction '+
-   signature+' before retrying. '+String(e)
-  );
+// ORBIT_STAGE13_LEGACY_READONLY
+// Build a Raydium LaunchLab *legacy* transaction to test whether a V0 ALT
+// is the reason Phantom cannot inspect our Devnet creation transaction.
+// Does not request any signature, broadcast, upload, or create a token.
+export async function inspectRaydiumLegacy(
+ connection:Connection,config:AppConfig,wallet:WalletContextState
+):Promise<string>{
+ if(config.network!=='devnet'||!config.launchEnabled)
+  throw new Error('Legacy comparison is enabled for Solana Devnet only.');
+ if(!wallet.publicKey)throw new Error('Connect a dedicated Devnet wallet to inspect the transaction.');
+ const payer=wallet.publicKey;
+ const platformId=await requireLaunchPlatform(connection,config,payer);
+ const {configId,configInfo}=await verifyLaunchConfig(connection,config);
+ const raydium=await sdk(connection,config,wallet);
+ const mint=Keypair.generate();
+ const quote=await raydium.token.getTokenInfo(configInfo.mintB);
+ let built:any;
+ try{
+  built=await raydium.launchpad.createLaunchpad({
+   programId:program(config),mintA:mint.publicKey,
+   name:'ORBIT Legacy Audit',symbol:'ORBLEG',
+   uri:'https://example.com/orbit-legacy-audit-never-published.json',
+   decimals:6,migrateType:'cpmm',configId,configInfo,
+   mintBDecimals:quote.decimals,createOnly:true,
+   buyAmount:new BN(1000),slippage:new BN(100),
+   extraSigners:[mint],txVersion:TxVersion.LEGACY,platformId
+  } as any);
+ }catch(e){
+  return 'ORBIT Stage 13 - LEGACY read-only comparison\n'+
+   'Legacy Raydium SDK build: FAILED. '+String((e as Error)?.message||e)+
+   '\nNo transaction sent, no signature requested. Do not use Create Token.';
  }
+ if(!Array.isArray(built.transactions)||built.transactions.length!==1)
+  return 'ORBIT Stage 13 - LEGACY read-only comparison\n'+
+   'Expected 1 legacy transaction, SDK built '+String(built.transactions?.length??'none')+
+   '. This variant is not supported by the current one-transaction ORBIT launch. No signature or broadcast.';
+ const original=built.transactions[0];
+ if(!(original instanceof Transaction))
+  throw new Error('Raydium returned a non-legacy transaction while LEGACY was requested.');
+ if(original.feePayer&&!original.feePayer.equals(payer))
+  throw new Error('Legacy builder fee payer differs from the connected Devnet wallet.');
+ const bh=await connection.getLatestBlockhash('confirmed');
+ // Reconstruct only the *instructions*; SDK signatures are intentionally discarded.
+ const tx=new Transaction({feePayer:payer,recentBlockhash:bh.blockhash});
+ tx.add(...original.instructions);
+ const msg=tx.compileMessage();
+ const signers=msg.accountKeys.slice(0,msg.header.numRequiredSignatures);
+ if(signers.length!==2||!signers[0].equals(payer)||!signers[1].equals(mint.publicKey))
+  throw new Error('Unexpected legacy transaction signers. Nothing was signed or submitted.');
+ const called=[...new Set(tx.instructions.map(ix=>ix.programId.toBase58()))];
+ const allowed=new Set([
+  program(config).toBase58(),SystemProgram.programId.toBase58(),
+  TOKEN_PROGRAM_ID.toBase58(),
+  'TokenzQdBNbLqP5VEhdkAS6EPFZ6LKruL4y3Yz9KP',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+  'ComputeBudget111111111111111111111111111111',
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'
+ ]);
+ const unknown=called.filter(id=>!allowed.has(id));
+ if(unknown.length||!called.includes(program(config).toBase58()))
+  throw new Error('Unknown/missing top-level program(s): '+unknown.join(', ')+'; no transaction submitted.');
+ let bytes:number;
+ try{bytes=tx.serialize({requireAllSignatures:false,verifySignatures:false}).length}
+ catch(e){
+  return 'ORBIT Stage 13 - LEGACY read-only comparison\n'+
+   'Legacy transaction could not serialize: '+String((e as Error)?.message||e)+
+   '\nNo wallet prompt or broadcast.';
+ }
+ if(bytes>1232)
+  return 'ORBIT Stage 13 - LEGACY read-only comparison\n'+
+   'Legacy transaction TOO LARGE: '+bytes+' bytes (max 1232). Do not switch the live launch to legacy. No wallet prompt or broadcast.';
+ const fee=await connection.getFeeForMessage(msg,'confirmed');
+ // Legacy web3.js overload: no second arg => unsigned simulation, no broadcast.
+ const sim=await connection.simulateTransaction(tx);
+ const status=sim.value.err?'FAILED '+JSON.stringify(sim.value.err):'PASSED (unsigned only)';
+ return [
+  'ORBIT Stage 13 - LEGACY read-only comparison',
+  'No wallet signature requested. No transaction sent. No token created.',
+  'Temporary mint and dummy metadata URI, not a production token.',
+  'Format: LEGACY (no address lookup tables)',
+  'Serialized bytes: '+bytes+' / 1232',
+  'Instructions: '+tx.instructions.length+'; required signers: '+signers.length,
+  'Fee: '+(fee.value===null?'unavailable':(fee.value/1e9).toFixed(9)+' SOL'),
+  'Top-level programs: '+called.join(', '),
+  'RPC simulation slot: '+sim.context.slot,
+  'RPC simulation: '+status,
+  'Units consumed: '+String(sim.value.unitsConsumed??'unavailable'),
+  'Last logs:\n'+(sim.value.logs||[]).slice(-8).join('\n'),
+  'This checks whether legacy formatting is feasible; it does NOT prove Phantom will approve a real launch.'
+ ].join('\n');
+}
 
- if(confirmation.value.err)
-  throw new Error(
-   'Transaction '+signature+' failed: '+
-   JSON.stringify(confirmation.value.err)
-  );
+// ORBIT_STAGE14_LEGACY_SIGN_ONLY
+// Compare the wallet-signing path for LEGACY Raydium LaunchLab transactions.
+// This diagnostic NEVER broadcasts, registers, uploads metadata, or launches a token.
+// Use a separate test-only Phantom account. Never override a wallet security warning.
+export async function testRaydiumLegacySigning(
+ connection:Connection,config:AppConfig,wallet:WalletContextState
+):Promise<string>{
+ if(config.network!=='devnet'||!config.launchEnabled)
+  throw new Error('Legacy signature test is available on Devnet only.');
+ if(!wallet.publicKey||!wallet.signTransaction)
+  throw new Error('Connect a Devnet wallet that supports signTransaction.');
+ const payer=wallet.publicKey;
+ const versions=wallet.wallet?.adapter?.supportedTransactionVersions;
+ if(versions&&!versions.has('legacy'))
+  throw new Error('This wallet adapter does not support legacy Solana transactions.');
+ const platformId=await requireLaunchPlatform(connection,config,payer);
+ const {configId,configInfo}=await verifyLaunchConfig(connection,config);
+ const raydium=await sdk(connection,config,wallet);
+ const mint=Keypair.generate();
+ const quote=await raydium.token.getTokenInfo(configInfo.mintB);
+ const built=await raydium.launchpad.createLaunchpad({
+  programId:program(config),mintA:mint.publicKey,
+  name:'ORBIT Legacy Sign Test',symbol:'ORBTST',
+  uri:'https://example.com/orbit-legacy-sign-test-never-published.json',
+  decimals:6,migrateType:'cpmm',configId,configInfo,
+  mintBDecimals:quote.decimals,createOnly:true,
+  buyAmount:new BN(1000),slippage:new BN(100),
+  extraSigners:[mint],txVersion:TxVersion.LEGACY,platformId
+ } as any);
+ if(!Array.isArray(built.transactions)||built.transactions.length!==1)
+  throw new Error('Expected one legacy launch transaction; diagnostic aborted.');
+ const source=built.transactions[0];
+ if(!(source instanceof Transaction))
+  throw new Error('Raydium did not build a LEGACY transaction.');
+ if(source.feePayer&&!source.feePayer.equals(payer))
+  throw new Error('Transaction fee payer differs from the connected wallet.');
+ // Rebuild from known Raydium instructions with a fresh Devnet blockhash.
+ // SDK-provided signatures are not forwarded to Phantom.
+ const latest=await connection.getLatestBlockhash('confirmed');
+ const tx=new Transaction({feePayer:payer,recentBlockhash:latest.blockhash});
+ tx.add(...source.instructions);
+ const msg=tx.compileMessage();
+ const signers=msg.accountKeys.slice(0,msg.header.numRequiredSignatures);
+ if(signers.length!==2||!signers[0].equals(payer)||!signers[1].equals(mint.publicKey))
+  throw new Error('Unexpected signer layout; no wallet request made.');
+ const invoked=tx.instructions.map(ix=>ix.programId.toBase58());
+ const allow=new Set([
+  program(config).toBase58(),SystemProgram.programId.toBase58(),
+  TOKEN_PROGRAM_ID.toBase58(),
+  'TokenzQdBNbLqP5VEhdkAS6EPFZ6LKruL4y3Yz9KP',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+  'ComputeBudget111111111111111111111111111111',
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'
+ ]);
+ if(!invoked.includes(program(config).toBase58())||invoked.some(x=>!allow.has(x)))
+  throw new Error('Unrecognized program in legacy transaction; no wallet request made.');
+ const bytes=tx.serialize({requireAllSignatures:false,verifySignatures:false}).length;
+ if(bytes>1232)throw new Error('Legacy transaction exceeds Solana packet size limit.');
+ // Explicit unsigned execution preflight; does not prove a wallet will sign.
+ const simulated=await connection.simulateTransaction(tx);
+ if(simulated.value.err)
+  throw new Error('Legacy preflight failed: '+JSON.stringify(simulated.value.err)+' | '+
+   (simulated.value.logs||[]).slice(-10).join(' | '));
+ // ORBIT_STAGE15_RETURNED_MESSAGE_DIFF
+ // Snapshot before the wallet call: some adapters mutate Transaction in-place.
+ const expected=tx.serializeMessage();
+ const beforePayer=tx.feePayer?.toBase58()||'';
+ const beforeBlockhash=tx.recentBlockhash||'';
+ const beforeInstructions=tx.instructions.map(ix=>({
+  program:ix.programId.toBase58(),
+  accounts:ix.keys.map(k=>k.pubkey.toBase58()+':'+(k.isSigner?'s':'-')+(k.isWritable?'w':'-')).join('|'),
+  data:Array.from(ix.data).join(',')
+ }));
+ let signed:Transaction;
+ try{
+  signed=await wallet.signTransaction(tx) as Transaction;
+ }catch(error){
+  throw new Error('Phantom declined the LEGACY launch signature (no broadcast). '+
+   String((error as Error)?.message||error)+
+   '. Do not bypass any security warning.');
+ }
+ if(!(signed instanceof Transaction))
+  throw new Error('Wallet returned an unexpected transaction type.');
+ const actual=signed.serializeMessage();
+ // ORBIT_STAGE16_PHANTOM_COMPUTE_BUDGET_VERIFY
+ // Phantom documents automatic priority-fee enhancement on unsigned dApp
+ // transactions. It may prepend two ComputeBudget instructions while signing.
+ // Compare the original Raydium instruction AFTER stripping exactly these two
+ // extras. Never accept another program, account, data, payer, or hash change.
+ let phantomPriorityNote='Wallet returned the original Raydium message unchanged.';
+ if(actual.length!==expected.length||actual.some((v,i)=>v!==expected[i])){
+  const computeBudget='ComputeBudget111111111111111111111111111111';
+  const afterInstructions=signed.instructions.map(ix=>({
+   program:ix.programId.toBase58(),
+   accounts:ix.keys.map(k=>k.pubkey.toBase58()+':'+(k.isSigner?'s':'-')+(k.isWritable?'w':'-')).join('|'),
+   data:Array.from(ix.data).join(',')
+  }));
+  const prefixCount=afterInstructions.length-beforeInstructions.length;
+  const extra=signed.instructions.slice(0,Math.max(prefixCount,0));
+  const tail=afterInstructions.slice(Math.max(prefixCount,0));
+  // ORBIT_STAGE17_CANONICAL_LEGACY_MATCH
+  // Some wallets deserialize/rebuild instructions and normalize AccountMeta
+  // flags. Do NOT trust a relaxed comparison: reconstruct the exact *message*
+  // from the original instruction and the two bounded ComputeBudget extras.
+  const originalProgramSame=tail.length===beforeInstructions.length&&
+   tail.every((ix,i)=>ix.program===beforeInstructions[i].program);
+  const originalAddressesSame=tail.length===beforeInstructions.length&&
+   tail.every((ix,i)=>{
+    const before=beforeInstructions[i].accounts.split('|').filter(Boolean).map(x=>x.split(':')[0]);
+    const after=ix.accounts.split('|').filter(Boolean).map(x=>x.split(':')[0]);
+    return before.length===after.length&&before.every((a,j)=>a===after[j]);
+   });
+  const originalDataSame=tail.length===beforeInstructions.length&&
+   tail.every((ix,i)=>ix.data===beforeInstructions[i].data);
+  const flagsDifferent=tail.length===beforeInstructions.length&&
+   tail.some((ix,i)=>ix.accounts!==beforeInstructions[i].accounts);
+  const samePayer=beforePayer===(signed.feePayer?.toBase58()||'');
+  const sameHash=beforeBlockhash===(signed.recentBlockhash||'');
+  let cuLimit:number|null=null;
+  let cuPrice:bigint|null=null;
+  let computeOnly=prefixCount===2;
+  for(const ix of extra){
+   if(!ix.programId.toBase58 || ix.programId.toBase58()!==computeBudget||ix.keys.length!==0){
+    computeOnly=false;continue;
+   }
+   const d=ix.data;
+   if(d.length===5&&d[0]===2&&cuLimit===null){
+    cuLimit=(d[1]|d[2]<<8|d[3]<<16|d[4]<<24)>>>0;
+   }else if(d.length===9&&d[0]===3&&cuPrice===null){
+    cuPrice=0n;
+    for(let i=8;i>=1;i--)cuPrice=(cuPrice<<8n)+BigInt(d[i]);
+   }else computeOnly=false;
+  }
+  // These bounds apply only to this local signing diagnostic. No SOL is spent.
+  const allowedBudget=computeOnly&&cuLimit!==null&&cuPrice!==null&&
+   cuLimit>=110_000&&cuLimit<=400_000&&cuPrice<=1_000_000n&&
+   (BigInt(cuLimit)*cuPrice+999_999n)/1_000_000n<=1_000_000n;
+  // Recreate the expected message using the ORIGINAL (pre-wallet) account
+  // metadata, ORIGINAL Raydium data, and EXACT wallet-returned ComputeBudget
+  // instructions. The wallet's serialized message must match byte-for-byte.
+  // This covers account access privileges, signer layout and instruction data.
+  let canonicalMessageSame=false;
+  if(allowedBudget&&samePayer&&sameHash&&originalProgramSame&&
+     originalAddressesSame&&originalDataSame&&beforeInstructions.length===1){
+   const orig=beforeInstructions[0];
+   const keys=orig.accounts.split('|').filter(Boolean).map(raw=>{
+    const colon=raw.lastIndexOf(':');
+    const flags=raw.slice(colon+1);
+    return {pubkey:new PublicKey(raw.slice(0,colon)),
+     isSigner:flags.includes('s'),isWritable:flags.includes('w')};
+   });
+   const data=Uint8Array.from(orig.data.split(',').filter(Boolean).map(Number)) as any;
+   const expectedTx=new Transaction({feePayer:payer,recentBlockhash:beforeBlockhash});
+   expectedTx.add(...extra,new TransactionInstruction({
+    programId:new PublicKey(orig.program),keys,data
+   }));
+   const reconstructed=expectedTx.serializeMessage();
+   canonicalMessageSame=reconstructed.length===actual.length&&
+    reconstructed.every((b,i)=>b===actual[i]);
+  }
+  const originalRaydiumUnchanged=originalProgramSame&&originalAddressesSame&&
+   originalDataSame&&canonicalMessageSame;
+  if(!samePayer||!sameHash||!originalRaydiumUnchanged||!allowedBudget){
+   throw new Error('Stage 17: returned LEGACY transaction differs from expected canonical message; NO broadcast. '+
+    'Payer unchanged='+samePayer+', blockhash unchanged='+sameHash+
+    ', Raydium program same='+originalProgramSame+
+    ', ordered account addresses same='+originalAddressesSame+
+    ', Raydium instruction data same='+originalDataSame+
+    ', raw account flags differ='+flagsDifferent+
+    ', canonical message byte-exact='+canonicalMessageSame+
+    ', two recognized bounded ComputeBudget instructions='+allowedBudget+
+    '. Before/after instruction count='+beforeInstructions.length+'/'+afterInstructions.length+
+    '. Do not bypass any wallet security warning.');
+  }
+  if(cuLimit===null||cuPrice===null)throw new Error('Stage 16: missing ComputeBudget values.');
+  const changedMessage=signed.compileMessage();
+  const returnedSigners=changedMessage.accountKeys.slice(0,changedMessage.header.numRequiredSignatures);
+  if(returnedSigners.length!==2||!returnedSigners[0].equals(payer)||!returnedSigners[1].equals(mint.publicKey))
+   throw new Error('Stage 16: transaction signer accounts changed; NO broadcast.');
+  phantomPriorityNote='Wallet added two bounded ComputeBudget instructions; reconstructed canonical message matches exactly. '+
+   'CU limit='+cuLimit+'; CU price='+cuPrice+' micro-lamports/CU; '+
+   'estimated priority fee='+Number((BigInt(cuLimit)*cuPrice+999_999n)/1_000_000n)/1e9+' SOL. '+
+   'Fee payer, blockhash, Raydium accounts and data are unchanged.';
+ }
+ const walletSig=signed.signatures.find(s=>s.publicKey.equals(payer))?.signature;
+ if(!walletSig||walletSig.length!==64||!walletSig.some(v=>v!==0))
+  throw new Error('Phantom did not return a valid-format payer signature.');
+ if(!signed.verifySignatures(false))
+  throw new Error('Wallet signature failed local cryptographic verification.');
+ // Adding the temporary mint signature AFTER wallet approval must preserve it.
+ const payerSig=new Uint8Array(walletSig);
+ signed.partialSign(mint);
+ const newPayerSig=signed.signatures.find(s=>s.publicKey.equals(payer))?.signature;
+ if(!newPayerSig||newPayerSig.some((v,i)=>v!==payerSig[i]))
+  throw new Error('Mint co-signing unexpectedly changed the wallet signature.');
+ if(!signed.verifySignatures(true))
+  throw new Error('The fully signed legacy transaction failed local verification.');
+ const finalSize=signed.serialize().length;
+ if(finalSize>1232)throw new Error('Signed legacy transaction is oversized.');
+ // CRITICAL: no sendTransaction / sendRawTransaction / execute / postJson here.
+ return 'ORBIT Stage 14 - LEGACY SIGNATURE TEST: PASSED\n'+
+  'Wallet signed the Raydium legacy transaction. Temporary mint co-signed locally.\n'+
+  phantomPriorityNote+'\n'+
+  'Required signers: 2; transaction bytes: '+finalSize+'.\n'+
+  'RPC unsigned execution preflight: PASSED. Both local signatures: VERIFIED.\n'+
+  'NO transaction broadcast. NO token created. NO SOL spent.\n'+
+  'This does not authorize or enable a real launch. Do not ignore future Phantom warnings.';
+}
 
+// ORBIT_STAGE10_VERIFIED_DEVNET_LAUNCH
+// Devnet only. No automatic retries or wallet-warning bypass.
+// ORBIT_STAGE18_DEVNET_LEGACY_REAL_LAUNCH
+// Only the Devnet path is permitted. Wallet may add a bounded priority fee.
+// Original Raydium message is verified byte-for-byte before broadcasting.
+export async function launchToken(
+ connection:Connection,config:AppConfig,wallet:WalletContextState,
+ input:{name:string;symbol:string;uri:string}
+){
+ if(config.network!=='devnet'||!config.launchEnabled)
+  throw new Error(config.launchBlockReason||'Launch is disabled outside Devnet.');
+ const genesis=await connection.getGenesisHash();
+ if(genesis!=='EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG')
+  throw new Error('RPC genesis is not the official Solana Devnet; launch refused.');
+ if(!/^https:\/\/[^\s]+$/.test(input.uri))
+  throw new Error('Token metadata must have a valid HTTPS URI.');
+ if(input.name.trim().length<2||input.name.trim().length>32||
+    !/^[a-zA-Z0-9_]{2,10}$/.test(input.symbol))
+  throw new Error('Invalid token name or ticker.');
+ if(!wallet.publicKey||!wallet.signTransaction)
+  throw new Error('Connect a dedicated Devnet wallet that supports signTransaction.');
+ const payer=wallet.publicKey;
+ const versions=wallet.wallet?.adapter?.supportedTransactionVersions;
+ if(versions&&!versions.has('legacy'))
+  throw new Error('This wallet adapter does not support legacy Solana transactions.');
+ const platformId=await requireLaunchPlatform(connection,config,payer);
+ const {configId,configInfo}=await verifyLaunchConfig(connection,config);
+ const raydium=await sdk(connection,config,wallet);
+ const mint=Keypair.generate();
+ const quote=await raydium.token.getTokenInfo(configInfo.mintB);
+ const built=await raydium.launchpad.createLaunchpad({
+  programId:program(config),mintA:mint.publicKey,
+  name:input.name.trim(),symbol:input.symbol.trim().toUpperCase(),
+  uri:input.uri,
+  decimals:6,migrateType:'cpmm',configId,configInfo,
+  mintBDecimals:quote.decimals,createOnly:true,
+  buyAmount:new BN(1000),slippage:new BN(100),
+  extraSigners:[mint],txVersion:TxVersion.LEGACY,platformId
+ } as any);
+ if(!Array.isArray(built.transactions)||built.transactions.length!==1)
+  throw new Error('Expected one legacy launch transaction; diagnostic aborted.');
+ const source=built.transactions[0];
+ if(!(source instanceof Transaction))
+  throw new Error('Raydium did not build a LEGACY transaction.');
+ if(source.feePayer&&!source.feePayer.equals(payer))
+  throw new Error('Transaction fee payer differs from the connected wallet.');
+ // Rebuild from known Raydium instructions with a fresh Devnet blockhash.
+ // SDK-provided signatures are not forwarded to Phantom.
+ const latest=await connection.getLatestBlockhash('confirmed');
+ const tx=new Transaction({feePayer:payer,recentBlockhash:latest.blockhash});
+ tx.add(...source.instructions);
+ const msg=tx.compileMessage();
+ const signers=msg.accountKeys.slice(0,msg.header.numRequiredSignatures);
+ if(signers.length!==2||!signers[0].equals(payer)||!signers[1].equals(mint.publicKey))
+  throw new Error('Unexpected signer layout; no wallet request made.');
+ const invoked=tx.instructions.map(ix=>ix.programId.toBase58());
+ const allow=new Set([
+  program(config).toBase58(),SystemProgram.programId.toBase58(),
+  TOKEN_PROGRAM_ID.toBase58(),
+  'TokenzQdBNbLqP5VEhdkAS6EPFZ6LKruL4y3Yz9KP',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+  'ComputeBudget111111111111111111111111111111',
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'
+ ]);
+ if(!invoked.includes(program(config).toBase58())||invoked.some(x=>!allow.has(x)))
+  throw new Error('Unrecognized program in legacy transaction; no wallet request made.');
+ const bytes=tx.serialize({requireAllSignatures:false,verifySignatures:false}).length;
+ if(bytes>1232)throw new Error('Legacy transaction exceeds Solana packet size limit.');
+ // Explicit unsigned execution preflight; does not prove a wallet will sign.
+ const simulated=await connection.simulateTransaction(tx);
+ if(simulated.value.err)
+  throw new Error('Legacy preflight failed: '+JSON.stringify(simulated.value.err)+' | '+
+   (simulated.value.logs||[]).slice(-10).join(' | '));
+ // ORBIT_STAGE15_RETURNED_MESSAGE_DIFF
+ // Snapshot before the wallet call: some adapters mutate Transaction in-place.
+ const expected=tx.serializeMessage();
+ const beforePayer=tx.feePayer?.toBase58()||'';
+ const beforeBlockhash=tx.recentBlockhash||'';
+ const beforeInstructions=tx.instructions.map(ix=>({
+  program:ix.programId.toBase58(),
+  accounts:ix.keys.map(k=>k.pubkey.toBase58()+':'+(k.isSigner?'s':'-')+(k.isWritable?'w':'-')).join('|'),
+  data:Array.from(ix.data).join(',')
+ }));
+ let signed:Transaction;
+ try{
+  signed=await wallet.signTransaction(tx) as Transaction;
+ }catch(error){
+  throw new Error('Phantom declined the Devnet launch signature. '+
+   String((error as Error)?.message||error)+
+   '. Do not bypass any security warning or retry automatically.');
+ }
+ if(!(signed instanceof Transaction))
+  throw new Error('Wallet returned an unexpected transaction type.');
+ const actual=signed.serializeMessage();
+ // ORBIT_STAGE16_PHANTOM_COMPUTE_BUDGET_VERIFY
+ // Phantom documents automatic priority-fee enhancement on unsigned dApp
+ // transactions. It may prepend two ComputeBudget instructions while signing.
+ // Compare the original Raydium instruction AFTER stripping exactly these two
+ // extras. Never accept another program, account, data, payer, or hash change.
+ let phantomPriorityNote='Wallet returned the original Raydium message unchanged.';
+ if(actual.length!==expected.length||actual.some((v,i)=>v!==expected[i])){
+  const computeBudget='ComputeBudget111111111111111111111111111111';
+  const afterInstructions=signed.instructions.map(ix=>({
+   program:ix.programId.toBase58(),
+   accounts:ix.keys.map(k=>k.pubkey.toBase58()+':'+(k.isSigner?'s':'-')+(k.isWritable?'w':'-')).join('|'),
+   data:Array.from(ix.data).join(',')
+  }));
+  const prefixCount=afterInstructions.length-beforeInstructions.length;
+  const extra=signed.instructions.slice(0,Math.max(prefixCount,0));
+  const tail=afterInstructions.slice(Math.max(prefixCount,0));
+  // ORBIT_STAGE17_CANONICAL_LEGACY_MATCH
+  // Some wallets deserialize/rebuild instructions and normalize AccountMeta
+  // flags. Do NOT trust a relaxed comparison: reconstruct the exact *message*
+  // from the original instruction and the two bounded ComputeBudget extras.
+  const originalProgramSame=tail.length===beforeInstructions.length&&
+   tail.every((ix,i)=>ix.program===beforeInstructions[i].program);
+  const originalAddressesSame=tail.length===beforeInstructions.length&&
+   tail.every((ix,i)=>{
+    const before=beforeInstructions[i].accounts.split('|').filter(Boolean).map(x=>x.split(':')[0]);
+    const after=ix.accounts.split('|').filter(Boolean).map(x=>x.split(':')[0]);
+    return before.length===after.length&&before.every((a,j)=>a===after[j]);
+   });
+  const originalDataSame=tail.length===beforeInstructions.length&&
+   tail.every((ix,i)=>ix.data===beforeInstructions[i].data);
+  const flagsDifferent=tail.length===beforeInstructions.length&&
+   tail.some((ix,i)=>ix.accounts!==beforeInstructions[i].accounts);
+  const samePayer=beforePayer===(signed.feePayer?.toBase58()||'');
+  const sameHash=beforeBlockhash===(signed.recentBlockhash||'');
+  let cuLimit:number|null=null;
+  let cuPrice:bigint|null=null;
+  let computeOnly=prefixCount===2;
+  for(const ix of extra){
+   if(!ix.programId.toBase58 || ix.programId.toBase58()!==computeBudget||ix.keys.length!==0){
+    computeOnly=false;continue;
+   }
+   const d=ix.data;
+   if(d.length===5&&d[0]===2&&cuLimit===null){
+    cuLimit=(d[1]|d[2]<<8|d[3]<<16|d[4]<<24)>>>0;
+   }else if(d.length===9&&d[0]===3&&cuPrice===null){
+    cuPrice=0n;
+    for(let i=8;i>=1;i--)cuPrice=(cuPrice<<8n)+BigInt(d[i]);
+   }else computeOnly=false;
+  }
+  // Maximum 0.001 SOL priority fee; reject any unexpected wallet mutation.
+  const allowedBudget=computeOnly&&cuLimit!==null&&cuPrice!==null&&
+   cuLimit>=110_000&&cuLimit<=400_000&&cuPrice<=1_000_000n&&
+   (BigInt(cuLimit)*cuPrice+999_999n)/1_000_000n<=1_000_000n;
+  // Recreate the expected message using the ORIGINAL (pre-wallet) account
+  // metadata, ORIGINAL Raydium data, and EXACT wallet-returned ComputeBudget
+  // instructions. The wallet's serialized message must match byte-for-byte.
+  // This covers account access privileges, signer layout and instruction data.
+  let canonicalMessageSame=false;
+  if(allowedBudget&&samePayer&&sameHash&&originalProgramSame&&
+     originalAddressesSame&&originalDataSame&&beforeInstructions.length===1){
+   const orig=beforeInstructions[0];
+   const keys=orig.accounts.split('|').filter(Boolean).map(raw=>{
+    const colon=raw.lastIndexOf(':');
+    const flags=raw.slice(colon+1);
+    return {pubkey:new PublicKey(raw.slice(0,colon)),
+     isSigner:flags.includes('s'),isWritable:flags.includes('w')};
+   });
+   // ORBIT_STAGE18_BUFFER_TYPE_FIX
+   const data=Buffer.from(orig.data.split(',').filter(Boolean).map(Number));
+   const expectedTx=new Transaction({feePayer:payer,recentBlockhash:beforeBlockhash});
+   expectedTx.add(...extra,new TransactionInstruction({
+    programId:new PublicKey(orig.program),keys,data
+   }));
+   const reconstructed=expectedTx.serializeMessage();
+   canonicalMessageSame=reconstructed.length===actual.length&&
+    reconstructed.every((b,i)=>b===actual[i]);
+  }
+  const originalRaydiumUnchanged=originalProgramSame&&originalAddressesSame&&
+   originalDataSame&&canonicalMessageSame;
+  if(!samePayer||!sameHash||!originalRaydiumUnchanged||!allowedBudget){
+   throw new Error('Stage 18: returned LEGACY transaction differs from expected canonical message; launch blocked. '+
+    'Payer unchanged='+samePayer+', blockhash unchanged='+sameHash+
+    ', Raydium program same='+originalProgramSame+
+    ', ordered account addresses same='+originalAddressesSame+
+    ', Raydium instruction data same='+originalDataSame+
+    ', raw account flags differ='+flagsDifferent+
+    ', canonical message byte-exact='+canonicalMessageSame+
+    ', two recognized bounded ComputeBudget instructions='+allowedBudget+
+    '. Before/after instruction count='+beforeInstructions.length+'/'+afterInstructions.length+
+    '. Do not bypass any wallet security warning.');
+  }
+  if(cuLimit===null||cuPrice===null)throw new Error('Stage 16: missing ComputeBudget values.');
+  const changedMessage=signed.compileMessage();
+  const returnedSigners=changedMessage.accountKeys.slice(0,changedMessage.header.numRequiredSignatures);
+  if(returnedSigners.length!==2||!returnedSigners[0].equals(payer)||!returnedSigners[1].equals(mint.publicKey))
+   throw new Error('Stage 18: transaction signer accounts changed; launch blocked.');
+  phantomPriorityNote='Wallet added two bounded ComputeBudget instructions; reconstructed canonical message matches exactly. '+
+   'CU limit='+cuLimit+'; CU price='+cuPrice+' micro-lamports/CU; '+
+   'estimated priority fee='+Number((BigInt(cuLimit)*cuPrice+999_999n)/1_000_000n)/1e9+' SOL. '+
+   'Fee payer, blockhash, Raydium accounts and data are unchanged.';
+ }
+ const walletSig=signed.signatures.find(s=>s.publicKey.equals(payer))?.signature;
+ if(!walletSig||walletSig.length!==64||!walletSig.some(v=>v!==0))
+  throw new Error('Phantom did not return a valid-format payer signature.');
+ if(!signed.verifySignatures(false))
+  throw new Error('Wallet signature failed local cryptographic verification.');
+ // Adding the temporary mint signature AFTER wallet approval must preserve it.
+ const payerSig=new Uint8Array(walletSig);
+ signed.partialSign(mint);
+ const newPayerSig=signed.signatures.find(s=>s.publicKey.equals(payer))?.signature;
+ if(!newPayerSig||newPayerSig.some((v,i)=>v!==payerSig[i]))
+  throw new Error('Mint co-signing unexpectedly changed the wallet signature.');
+ if(!signed.verifySignatures(true))
+  throw new Error('The fully signed legacy transaction failed local verification.');
+ const finalSize=signed.serialize().length;
+ if(finalSize>1232)throw new Error('Signed legacy transaction is oversized.');
+ // Both signatures were verified locally. The RPC must now perform preflight.
+ // Do not use SDK execute(), do not resend automatically, do not skip preflight.
+ const serialized=signed.serialize({requireAllSignatures:true,verifySignatures:true});
+ if(serialized.length!==finalSize)
+  throw new Error('Serialized transaction changed unexpectedly; launch blocked.');
+ let signature:string;
+ try{
+  signature=await connection.sendRawTransaction(serialized,{
+   skipPreflight:false,preflightCommitment:'confirmed',maxRetries:0
+  });
+ }catch(e){
+  // RPC might have accepted a transaction before a connection error.
+  throw new Error('Devnet submission unconfirmed. Check wallet activity before retrying. '+
+   String((e as Error)?.message||e));
+ }
+ let outcome;
+ try{
+  outcome=await connection.confirmTransaction({signature,...latest},'confirmed');
+ }catch(e){
+  throw new Error('Transaction status uncertain, do NOT retry without checking Devnet explorer. '+
+   'Signature: '+signature+'; '+String((e as Error)?.message||e));
+ }
+ if(outcome.value.err)
+  throw new Error('Devnet launch transaction '+signature+' failed: '+
+   JSON.stringify(outcome.value.err));
+ // The on-chain confirmation is the source of truth. Off-chain registration
+ // remains in App.tsx; its pending-launch recovery protects a confirmed mint.
  return {
   mint:mint.publicKey.toBase58(),
   poolId:built.extInfo.address.poolId.toBase58(),
-  programId:programId.toBase58(),
+  programId:program(config).toBase58(),
   txSignature:signature
  };
+
 }
 
+
+
 export async function curveTrade(connection:Connection,config:AppConfig,wallet:WalletContextState,item:Launch,side:'buy'|'sell',amount:string,slippageBps:number){
+ // ORBIT_STAGE19_DEVNET_LEGACY_CURVE_TRADE
+ if(config.network!=='devnet')throw new Error('Stage 19 bonding-curve trading is Devnet-only; Mainnet trades are disabled.');
  if(!wallet.publicKey||!wallet.signAllTransactions)throw new Error('Connect wallet');
- if(config.network==='mainnet-beta'&&!config.mainnetTradingEnabled)throw new Error('Mainnet trading is disabled until reviewed');
+ // ORBIT_STAGE19_TYPEFIX_DEVNET_NARROWING: the Devnet-only guard above makes Mainnet branch unreachable.
  if(slippageBps<10||slippageBps>500)throw new Error('Allowed slippage: 0.1% to 5%');
  if(item.network!==config.network)throw new Error('Token network does not match the connected Solana network');
  const mintA=new PublicKey(item.mint),programId=new PublicKey(item.programId);
@@ -405,10 +859,10 @@ export async function curveTrade(connection:Connection,config:AppConfig,wallet:W
  const mintInfo=await raydium.token.getTokenInfo(mintA);
  const mintBInfo=await raydium.token.getTokenInfo(p.mintB);
  if(side==='buy'){
-  const {execute}=await raydium.launchpad.buyToken({programId,mintA,mintAProgram:new PublicKey(mintInfo.programId),mintB:p.mintB,mintBProgram:new PublicKey(mintBInfo.programId),poolInfo:p,configInfo:p.configInfo,platformFeeRate:platformInfo.feeRate,buyAmount:new BN(amountBaseUnits(amount,p.mintDecimalsB)),slippage:new BN(slippageBps),txVersion:TxVersion.V0} as any);
+  const {execute}=await raydium.launchpad.buyToken({programId,mintA,mintAProgram:new PublicKey(mintInfo.programId),mintB:p.mintB,mintBProgram:new PublicKey(mintBInfo.programId),poolInfo:p,configInfo:p.configInfo,platformFeeRate:platformInfo.feeRate,buyAmount:new BN(amountBaseUnits(amount,p.mintDecimalsB)),slippage:new BN(slippageBps),txVersion:TxVersion.LEGACY} as any);
   return (await execute({sendAndConfirm:true})).txId;
  }
- const {execute}=await raydium.launchpad.sellToken({programId,mintA,mintAProgram:new PublicKey(mintInfo.programId),mintB:p.mintB,mintBProgram:new PublicKey(mintBInfo.programId),poolInfo:p,configInfo:p.configInfo,platformFeeRate:platformInfo.feeRate,sellAmount:new BN(amountBaseUnits(amount,p.mintDecimalsA)),slippage:new BN(slippageBps),txVersion:TxVersion.V0} as any);
+ const {execute}=await raydium.launchpad.sellToken({programId,mintA,mintAProgram:new PublicKey(mintInfo.programId),mintB:p.mintB,mintBProgram:new PublicKey(mintBInfo.programId),poolInfo:p,configInfo:p.configInfo,platformFeeRate:platformInfo.feeRate,sellAmount:new BN(amountBaseUnits(amount,p.mintDecimalsA)),slippage:new BN(slippageBps),txVersion:TxVersion.LEGACY} as any);
  return (await execute({sendAndConfirm:true})).txId;
 }
 function b64(data:Uint8Array){let raw='';for(let i=0;i<data.length;i+=8192)raw+=String.fromCharCode(...data.slice(i,i+8192));return btoa(raw)}

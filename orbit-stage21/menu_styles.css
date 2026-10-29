@@ -1,0 +1,53 @@
+/* ORBIT_STAGE21_MENU_POPUP — compact, floating three-dot menu, no page navigation */
+.bottom-nav .orbit-menu-anchor{
+  position:relative;display:flex;align-items:center;justify-content:center;
+  flex:1;min-width:0;height:100%;overflow:visible;
+}
+.bottom-nav .orbit-menu-anchor>.orbit-menu-trigger{
+  width:100%;height:100%;flex:1;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:3px;border:0;
+  padding:0;background:none;color:inherit;
+}
+.bottom-nav .orbit-menu-anchor>.orbit-menu-trigger.active{color:var(--mint)}
+.bottom-nav .orbit-more-popup{
+  position:absolute;right:8px;bottom:calc(100% + 13px);
+  width:265px;max-width:calc(100vw - 24px);
+  display:flex;flex-direction:column;gap:3px;
+  padding:11px;background:linear-gradient(136deg,#242a29 0%,#1d2125 54%,#15181c 100%);
+  border:1px solid #393f42;border-radius:17px;
+  box-shadow:0 17px 48px rgba(0,0,0,.68);
+  backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  z-index:60;
+}
+.bottom-nav .orbit-more-popup::after{
+  content:"";position:absolute;bottom:-6px;right:24px;width:10px;height:10px;
+  background:#171a1e;border-right:1px solid #393f42;border-bottom:1px solid #393f42;
+  transform:rotate(45deg);
+}
+.bottom-nav .orbit-more-popup button{
+  display:flex;flex:0 0 auto;flex-direction:row;align-items:center;
+  justify-content:flex-start;gap:15px;
+  width:100%;height:auto;min-height:49px;padding:11px 12px;
+  color:#eeeff1;background:transparent;border:0;border-radius:10px;
+  font-size:15px;font-weight:560;text-align:left;letter-spacing:-.015em;
+}
+.bottom-nav .orbit-more-popup button:hover,
+.bottom-nav .orbit-more-popup button:focus-visible{
+  color:var(--mint);background:#ffffff12;
+}
+.bottom-nav .orbit-more-popup button svg{
+  width:21px;height:21px;stroke-width:1.8;flex-shrink:0;
+}
+.bottom-nav .orbit-more-popup button span{
+  display:inline;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:inherit;
+}
+@media(min-width:1000px){
+  .bottom-nav .orbit-menu-anchor{flex:0 0 120px;}
+}
+@media(max-width:380px){
+  .bottom-nav .orbit-more-popup{width:240px;}
+  .bottom-nav .orbit-more-popup button{font-size:14px;min-height:46px;}
+}
+@media(prefers-reduced-motion:reduce){
+  .bottom-nav .orbit-more-popup{scroll-behavior:auto;}
+}

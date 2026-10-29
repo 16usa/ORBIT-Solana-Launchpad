@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import {makeLiveHandler} from './live.mjs';
 import { parseLaunchInput, metadataInput, mkdir, loadStore, saveStore, mediaBytes, rpcCall, formatPublicUrl, headersJson, validMint } from './core.mjs';
 
 try {process.loadEnvFile(path.resolve('.env'));} catch(e){if(e.code!=='ENOENT')throw e;}
@@ -64,6 +65,7 @@ async function checkChain(input){
  if(!instructions.some(i=>i.programId===allowed))throw new Error('Launch transaction did not invoke the allowlisted Raydium program');
  return {verified:true,confidence:allowed?'allowlisted-launch-accounts':'transaction-accounts'};
 }
+const handleLiveRoute=makeLiveHandler({dataDir,json,error,readJson});
 export function makeServer(){return http.createServer(async(req,res)=>{
  try{
   const u=new URL(req.url||'/', 'http://localhost');const pathname=u.pathname;
@@ -77,6 +79,7 @@ export function makeServer(){return http.createServer(async(req,res)=>{
    const mint=pathname.split('/').at(-1);return json(res,200,{item:loadStore(launchesFile,[]).find(l=>l.mint===mint)||null});
   }
   if(pathname.startsWith('/api/') && !hitRate(req))return error(res,429,'Rate limited');
+  if(pathname.startsWith('/api/live'))return await handleLiveRoute(req,res,u);
   // Live, non-cached Devnet preflight. Does not sign transactions or expose credentials.
   if(pathname==='/api/network-status' && req.method==='GET'){
    const programId=process.env.RAYDIUM_PROGRAM_ID||'';

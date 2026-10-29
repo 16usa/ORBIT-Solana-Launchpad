@@ -1,0 +1,97 @@
+// ORBIT Stage 22: LiveKit-backed, wallet-authenticated test live sessions.
+// This is a single-instance Devnet MVP, NOT a production moderation system.
+import { createHash, createPublicKey, randomBytes, randomUUID, timingSafeEqual, verify as verifyEd25519 } from 'node:crypto';
+import { saveStore, loadStore, validMint } from './core.mjs';
+import path from 'node:path';
+
+const B58='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function base58Decode(input){
+ if(typeof input!=='string'||!/^[1-9A-HJ-NP-Za-km-z]+$/.test(input)) throw new Error('Invalid public key');
+ let n=0n;for(const c of input){const idx=B58.indexOf(c);if(idx<0)throw new Error('Invalid base58');n=n*58n+BigInt(idx)}
+ const arr=[];while(n>0n){arr.unshift(Number(n&255n));n>>=8n}
+ for(const c of input){if(c!=='1')break;arr.unshift(0)}return Buffer.from(arr);
+}
+function verifySignature(address,message,signature){
+ if(!validMint(address)||typeof signature!=='string'||!/^[a-zA-Z0-9+/=]{84,90}$/.test(signature))return false;
+ const raw=base58Decode(address),sig=Buffer.from(signature,'base64');if(raw.length!==32||sig.length!==64)return false;
+ const spki=Buffer.concat([Buffer.from('302a300506032b6570032100','hex'),raw]);
+ return verifyEd25519(null,Buffer.from(message,'utf8'),createPublicKey({key:spki,format:'der',type:'spki'}),sig);
+}
+function sha(s){return createHash('sha256').update(s).digest();}
+function constantToken(test,expected){if(typeof test!=='string'||!/^[a-f0-9]{64}$/.test(test))return false;return timingSafeEqual(sha(test),expected)}
+function safeTitle(input){return typeof input==='string'?input.trim().replace(/[\x00-\x1f\x7f]/g,' ').replace(/\s+/g,' ').slice(0,64):''}
+function enabled(){return process.env.SOLANA_CLUSTER!=='mainnet-beta'&&/^wss:\/\/[^/]+/.test(process.env.LIVEKIT_URL||'')&&!!process.env.LIVEKIT_API_KEY&&!!process.env.LIVEKIT_API_SECRET}
+function publicLive(s){return {id:s.id,title:s.title,creator:s.wallet,createdAt:s.createdAt}}
+const drafts=new Map();const streams=new Map();
+let sdk=null;async function clients(){
+ if(!enabled())throw new Error('Live streaming is not configured. Set LIVEKIT_URL, LIVEKIT_API_KEY and LIVEKIT_API_SECRET on the API server.');
+ sdk ||= await import('livekit-server-sdk');
+ const {AccessToken,RoomServiceClient}=sdk;
+ const url=process.env.LIVEKIT_URL;
+ return {url,AccessToken,service:new RoomServiceClient(url.replace(/^wss:/,'https:'),process.env.LIVEKIT_API_KEY,process.env.LIVEKIT_API_SECRET)};
+}
+async function tokenFor(room,identity,publish){const {AccessToken}=await clients();const at=new AccessToken(process.env.LIVEKIT_API_KEY,process.env.LIVEKIT_API_SECRET,{identity,ttl:publish?'4h':'30m'});at.addGrant({roomJoin:true,room,canPublish:publish,canSubscribe:true,canPublishData:false});return at.toJwt()}
+function cleanup(){
+ const t=Date.now();for(const [k,c] of drafts)if(c.until<t)drafts.delete(k);
+ for(const [k,s] of streams)if(s.lastSeen && t-s.lastSeen>80_000 || !s.lastSeen && t-new Date(s.createdAt).getTime()>90_000)streams.delete(k);
+}
+export function makeLiveHandler({dataDir,json,error,readJson}){
+ const reportsFile=path.join(dataDir,'live-reports.json');
+ return async function handle(req,res,u){
+  const p=u.pathname;
+  cleanup();
+  if(p==='/api/live'&&req.method==='GET')return json(res,200,{enabled:enabled(),items:enabled()?[...streams.values()].filter(s=>s.lastSeen>0).map(publicLive):[],message:enabled()?'':'Configure LiveKit server credentials to enable live streaming.'});
+  if(p==='/api/live/challenge'&&req.method==='POST'){
+   if(!enabled())return error(res,503,'Live streaming is not configured');
+   const b=await readJson(req,900);
+   if(!validMint(b?.wallet)||base58Decode(b.wallet).length!==32)return error(res,400,'Valid Solana wallet address required');
+   const nonce=randomBytes(16).toString('hex'),until=Date.now()+90_000;
+   const message=`ORBIT Live authorization\nNetwork: Solana Devnet\nWallet: ${b.wallet}\nAction: Start stream\nNonce: ${nonce}\nExpires: ${new Date(until).toISOString()}`;
+   drafts.set(nonce,{wallet:b.wallet,message,until});if(drafts.size>500)drafts.clear();
+   return json(res,200,{nonce,message});
+  }
+  if(p==='/api/live/start'&&req.method==='POST'){
+   if(!enabled())return error(res,503,'Live streaming is not configured');
+   const b=await readJson(req,1400),c=drafts.get(b?.nonce);if(c)drafts.delete(b.nonce); // one-time, including invalid signatures
+   if(!c||c.until<Date.now()||c.wallet!==b.wallet||!verifySignature(c.wallet,c.message,b.signature))return error(res,403,'Wallet authorization failed. Reconnect and sign a new challenge.');
+   const title=safeTitle(b.title);if(title.length<3)return error(res,400,'Stream title must be at least 3 characters');
+   if([...streams.values()].some(s=>s.wallet===b.wallet))return error(res,409,'This wallet already has an active stream');
+   if(streams.size>=10)return error(res,429,'Maximum concurrent test streams reached');
+   const id=randomUUID(),room='orbit-live-'+id,adminKey=randomBytes(32).toString('hex');
+   const {service,url}=await clients();await service.createRoom({name:room,emptyTimeout:120,maxParticipants:120});
+   const token=await tokenFor(room,'host-'+id,true);
+   streams.set(id,{id,room,wallet:c.wallet,title,createdAt:new Date().toISOString(),lastSeen:0,secret:sha(adminKey)});
+   return json(res,201,{stream:publicLive(streams.get(id)),url,token,adminKey});
+  }
+  if(p==='/api/live/heartbeat'&&req.method==='POST'){
+   const b=await readJson(req,500),s=streams.get(b?.id);
+   if(!s||!constantToken(b.adminKey,s.secret))return error(res,403,'Invalid session');
+   s.lastSeen=Date.now();return json(res,200,{ok:true});
+  }
+  if(p==='/api/live/end'&&req.method==='POST'){
+   const b=await readJson(req,500),s=streams.get(b?.id);
+   if(!s||!constantToken(b.adminKey,s.secret))return error(res,403,'Invalid session');
+   streams.delete(s.id);
+   try{const {service}=await clients();await service.deleteRoom(s.room)}catch(e){console.warn('[LIVE] room shutdown:',String(e?.message||e).slice(0,180))}
+   return json(res,200,{ok:true});
+  }
+  if(p==='/api/live/join'&&req.method==='POST'){
+   const b=await readJson(req,400),s=streams.get(b?.id);
+   if(!s||!s.lastSeen)return error(res,404,'Stream is not live');
+   const token=await tokenFor(s.room,'viewer-'+randomUUID(),false);
+   return json(res,200,{stream:publicLive(s),token,url:process.env.LIVEKIT_URL});
+  }
+  if(p==='/api/live/report'&&req.method==='POST'){
+   const b=await readJson(req,500),s=streams.get(b?.id);
+   const reason=typeof b?.reason==='string'?b.reason.trim().slice(0,140):'';
+   if(!s||reason.length<6)return error(res,400,'Active stream and reason required');
+   const reports=loadStore(reportsFile,[]).slice(-999);
+   reports.push({id:randomUUID(),streamId:s.id,creator:s.wallet,reason,at:new Date().toISOString()});saveStore(reportsFile,reports);
+   return json(res,201,{ok:true});
+  }
+  return error(res,405,'Unsupported live endpoint');
+ };
+}
+
+// Exposed for dependency-free unit verification.
+export const liveTestHelpers={base58Decode,verifySignature,safeTitle};

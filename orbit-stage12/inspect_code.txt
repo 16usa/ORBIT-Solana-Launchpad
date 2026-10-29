@@ -1,0 +1,106 @@
+// ORBIT_STAGE12_READONLY_AUDIT
+// Read-only LaunchLab transaction preflight. This diagnostic NEVER requests
+// wallet signatures, signs with ephemeral keys, submits transactions, or
+// uploads token metadata. A successful RPC simulation does NOT prove safety.
+export async function inspectRaydiumLaunch(
+ connection:Connection,config:AppConfig,wallet:WalletContextState
+):Promise<string>{
+ if(config.network!=='devnet'||!config.launchEnabled)
+  throw new Error('Read-only launch audit is available on enabled Devnet only.');
+ if(!wallet.publicKey)
+  throw new Error('Connect a dedicated Devnet wallet to run this audit.');
+ const payer=wallet.publicKey;
+ const platformId=await requireLaunchPlatform(connection,config,payer);
+ const {configId,configInfo}=await verifyLaunchConfig(connection,config);
+ const raydium=await sdk(connection,config,wallet);
+ const quote=await raydium.token.getTokenInfo(configInfo.mintB);
+ const mint=Keypair.generate(); // Ephemeral only: never exported or broadcast.
+ const built=await raydium.launchpad.createLaunchpad({
+  programId:program(config),mintA:mint.publicKey,
+  name:'ORBIT Readonly Check',symbol:'ORBAUDIT',
+  uri:'https://example.com/orbit-readonly-check-not-for-launch.json',
+  decimals:6,migrateType:'cpmm',configId,configInfo,
+  mintBDecimals:quote.decimals,createOnly:true,
+  buyAmount:new BN(1000),slippage:new BN(100),
+  extraSigners:[mint],txVersion:TxVersion.V0,platformId
+ } as any);
+ if(!Array.isArray(built.transactions)||built.transactions.length!==1)
+  throw new Error('Expected one create-only Raydium transaction, received '+String(built.transactions?.length??'none')+'. No wallet prompt.');
+ const original=built.transactions[0];
+ if(!(original instanceof VersionedTransaction)||original.message.version!==0)
+  throw new Error('Raydium did not return a V0 transaction.');
+ const message=original.message;
+ const signerKeys=message.staticAccountKeys.slice(0,message.header.numRequiredSignatures);
+ if(signerKeys.length!==2||!signerKeys[0].equals(payer)||!signerKeys[1].equals(mint.publicKey))
+  throw new Error('Unexpected signer roles in Raydium launch. No wallet prompt.');
+ const lookupTables=await Promise.all(message.addressTableLookups.map(async lookup=>{
+  const response=await connection.getAddressLookupTable(lookup.accountKey,{commitment:'confirmed'});
+  if(!response.value)throw new Error('Missing Devnet ALT '+lookup.accountKey.toBase58());
+  return response.value;
+ }));
+ const allKeys=message.getAccountKeys({addressLookupTableAccounts:lookupTables});
+ const instructions=message.compiledInstructions;
+ const calledPrograms=instructions.map(ix=>{
+  const id=allKeys.get(ix.programIdIndex);
+  if(!id||ix.accountKeyIndexes.some(i=>!allKeys.get(i)))
+   throw new Error('Unresolved account index in V0 transaction. No wallet prompt.');
+  return id.toBase58();
+ });
+ const uniquePrograms=[...new Set(calledPrograms)];
+ const allowed=new Set([
+  program(config).toBase58(),SystemProgram.programId.toBase58(),
+  TOKEN_PROGRAM_ID.toBase58(),
+  'TokenzQdBNbLqP5VEhdkAS6EPFZ6LKruL4y3Yz9KP',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+  'ComputeBudget111111111111111111111111111111',
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'
+ ]);
+ const unknown=uniquePrograms.filter(id=>!allowed.has(id));
+ const bh=await connection.getLatestBlockhash('confirmed');
+ const tx=new VersionedTransaction(message); // Fresh, zeroed signature slots.
+ tx.message.recentBlockhash=bh.blockhash;
+ const byteSize=tx.serialize().length;
+ if(byteSize>1232)throw new Error('Raydium transaction exceeds 1232 bytes.');
+ const [genesis,balance,fee,programAccounts,simulation]=await Promise.all([
+  connection.getGenesisHash(),
+  connection.getBalance(payer,'confirmed'),
+  connection.getFeeForMessage(tx.message,'confirmed'),
+  connection.getMultipleAccountsInfo(uniquePrograms.map(id=>new PublicKey(id)),'confirmed'),
+  connection.simulateTransaction(tx,{
+   sigVerify:false,replaceRecentBlockhash:false,commitment:'confirmed',
+   accounts:{encoding:'base64',addresses:[payer.toBase58(),mint.publicKey.toBase58()]}
+  })
+ ]);
+ const executable=uniquePrograms.map((id,i)=>
+  id+' : '+(programAccounts[i]?.executable?'executable':programAccounts[i]?'not executable':'account missing')
+ );
+ const payerAfter=simulation.value.accounts?.[0]?.lamports;
+ const spending=typeof payerAfter==='number'
+  ?Math.max(0,(balance-payerAfter)/1e9).toFixed(9)+' SOL (estimated from simulation)'
+  :'not available from RPC';
+ const logs=(simulation.value.logs||[]).slice(-25).join('\n');
+ const state=simulation.value.err?'FAILED '+JSON.stringify(simulation.value.err):'PASSED (unsigned preflight only)';
+ const report=[
+  'ORBIT Stage 12 - READ-ONLY Devnet launch audit',
+  'No wallet signature requested. No transaction sent. No token created.',
+  'This uses a temporary diagnostic mint/URI, not your actual token form.',
+  'RPC genesis hash: '+genesis,
+  'RPC simulation slot: '+simulation.context.slot,
+  'Wallet Devnet balance: '+(balance/1e9).toFixed(6)+' SOL',
+  'Simulated payer decrease: '+spending,
+  'Signature fee estimate: '+(fee.value===null?'unavailable':(fee.value/1e9).toFixed(9)+' SOL'),
+  'Transaction: '+byteSize+' bytes; '+instructions.length+' instructions; '+signerKeys.length+' signers; '+lookupTables.length+' lookup table(s)',
+  'LaunchLab program: '+program(config).toBase58(),
+  'Launch config: '+configId.toBase58(),
+  'Platform config: '+platformId.toBase58(),
+  'Program allowlist: '+(unknown.length?'UNREVIEWED '+unknown.join(', '):'all invoked programs recognized'),
+  'Invoked program accounts:\n'+executable.join('\n'),
+  'RPC simulation: '+state,
+  'Units consumed: '+String(simulation.value.unitsConsumed??'unavailable'),
+  'Last program logs:\n'+(logs||'(none)'),
+  'IMPORTANT: sigVerify=false checks execution only; it does NOT prove that a wallet will sign or that Phantom safety warnings are wrong.'
+ ];
+ return report.join('\n');
+}
+

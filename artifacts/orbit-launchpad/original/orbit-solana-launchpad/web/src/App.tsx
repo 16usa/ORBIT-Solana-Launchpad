@@ -3,12 +3,13 @@ import {useWallet,useConnection} from '@solana/wallet-adapter-react';
 import OrbitWalletButton from './OrbitWalletButton';
 import {Rocket,Search,Plus,Home,Compass,UserRound,MoreHorizontal,ArrowUpRight,ChevronDown,Grid2X2,Rows3,SlidersHorizontal,Wallet,BarChart3,TrendingUp,Copy,CheckCircle2,AlertTriangle,X,Menu,Trophy,Radio,Coins,RefreshCw,LoaderCircle,ExternalLink,ShieldCheck,Info,ArrowLeft,Upload,Clock,Share2} from 'lucide-react';
 import {AppConfig,Launch,NetworkStatus,callApi,postJson,shorten,ago} from './api';
-import {PoolView,getPool,verifyLaunchConfig,launchToken,curveTrade,migratedTrade,requireLaunchPlatform,checkWalletSigning,checkRaydiumLaunchSigning} from './chain';
+import {PoolView,getPool,verifyLaunchConfig,launchToken,curveTrade,migratedTrade,requireLaunchPlatform,checkWalletSigning,inspectRaydiumLaunch,inspectRaydiumLegacy,testRaydiumLegacySigning} from './chain';
 import WalletSetup from './WalletProvider';
 import './styles.css';
+import OrbitLive from './OrbitLive';
 
 type Page='discover'|'home'|'create'|'portfolio'|'menu'|'leaderboard'|'live'|'rewards'|'token';
-function getInitialRoute():{page:Page;mint:string}{const h=location.hash.replace(/^#\/?/,'');if(h.startsWith('token/'))return {page:'token',mint:h.slice(6)};return {page:((['discover','home','create','portfolio','menu','leaderboard','live','rewards'].includes(h)?h:'discover') as Page),mint:''};}
+function getInitialRoute():{page:Page;mint:string}{const h=location.hash.replace(/^#\/?/,'');if(h==='menu')return {page:'discover',mint:''};if(h.startsWith('token/'))return {page:'token',mint:h.slice(6)};if(h.startsWith('live/'))return {page:'live',mint:h.slice(5)};return {page:((['discover','home','create','portfolio','menu','leaderboard','live','rewards'].includes(h)?h:'discover') as Page),mint:''};}
 function navigate(page:Page,mint=''){location.hash=page==='token'?`#/token/${mint}`:`#/${page}`;}
 function Logo(){return <div className="logo" aria-label="Orbit"><span className="logo-ball"><span className="logo-dot"/></span><span>ORBIT<span className="logo-period">.</span></span></div>}
 function Notice({network}:{network:string}){return <span className={'network-tag '+(network==='devnet'?'devnet':'mainnet')}><span className="live-dot"/> {network==='devnet'?'DEVNET — Test Network':'SOLANA MAINNET'}</span>}
@@ -17,7 +18,62 @@ function Banner({children}:{children:React.ReactNode}){return <div className="ba
 function IconButton({children,onClick,title}:{children:React.ReactNode;onClick:()=>void;title:string}){return <button className="icon-btn" onClick={onClick} title={title}>{children}</button>}
 function Empty({icon,heading,body,action}:{icon:React.ReactNode;heading:string;body:string;action?:React.ReactNode}){return <section className="empty"><div className="empty-icon">{icon}</div><h3>{heading}</h3><p>{body}</p>{action}</section>}
 const allNav:{page:Page;title:string;icon:React.ReactNode}[]=[{page:'home',title:'Home',icon:<Home/>},{page:'discover',title:'Explore',icon:<Compass/>},{page:'create',title:'Create',icon:<Plus/>},{page:'portfolio',title:'Profile',icon:<UserRound/>},{page:'menu',title:'Menu',icon:<MoreHorizontal/>}];
-function Nav({page}:{page:Page}){return <nav className="bottom-nav">{allNav.map(n=><button key={n.page} className={page===n.page?'active':''} onClick={()=>navigate(n.page)} title={n.title}>{n.icon}<span>{n.title}</span></button>)}</nav>}
+// ORBIT_STAGE21_MENU_POPUP: the three-dot navigation opens a popover instead of a page.
+function Nav({page}:{page:Page}){
+  const [open,setOpen]=useState(false);
+  const anchor=React.useRef<HTMLDivElement|null>(null);
+  const links:{page:Page;title:string;icon:React.ReactNode}[]=[
+    {page:'discover',title:'Explore tokens',icon:<Compass/>},
+    {page:'leaderboard',title:'Leaderboard',icon:<Trophy/>},
+    {page:'live',title:'Live',icon:<Radio/>},
+    {page:'rewards',title:'Rewards',icon:<Coins/>},
+    {page:'create',title:'Create token',icon:<Plus/>},
+  ];
+  useEffect(()=>{
+    if(!open)return;
+    const onOutside=(event:PointerEvent)=>{
+      if(anchor.current&&!anchor.current.contains(event.target as Node))setOpen(false);
+    };
+    const onKey=(event:KeyboardEvent)=>{
+      if(event.key==='Escape'){
+        setOpen(false);
+        anchor.current?.querySelector<HTMLButtonElement>('.orbit-menu-trigger')?.focus();
+      }
+    };
+    const onRoute=()=>setOpen(false);
+    document.addEventListener('pointerdown',onOutside);
+    document.addEventListener('keydown',onKey);
+    window.addEventListener('hashchange',onRoute);
+    return ()=>{
+      document.removeEventListener('pointerdown',onOutside);
+      document.removeEventListener('keydown',onKey);
+      window.removeEventListener('hashchange',onRoute);
+    };
+  },[open]);
+  const secondaryActive=page==='leaderboard'||page==='live'||page==='rewards';
+  return <nav className="bottom-nav" aria-label="Primary navigation">
+    {allNav.map(n=>n.page==='menu'?
+      <div className="orbit-menu-anchor" ref={anchor} key="menu">
+        <button type="button" className={'orbit-menu-trigger '+(open||secondaryActive?'active':'')}
+          aria-label="More options" aria-haspopup="menu" aria-expanded={open}
+          aria-controls={open?'orbit-more-menu':undefined} title="More options"
+          onClick={()=>setOpen(value=>!value)}>
+          <MoreHorizontal/><span>Menu</span>
+        </button>
+        {open&&<div className="orbit-more-popup" id="orbit-more-menu" role="menu" aria-label="More options">
+          {links.map(link=><button type="button" role="menuitem" key={link.page}
+            onClick={()=>{setOpen(false);navigate(link.page)}}>
+            {link.icon}<span>{link.title}</span>
+          </button>)}
+        </div>}
+      </div>
+    :<button type="button" key={n.page} className={page===n.page?'active':''}
+      title={n.title} onClick={()=>{setOpen(false);navigate(n.page)}}>
+      {n.icon}<span>{n.title}</span>
+    </button>)}
+  </nav>;
+}
+
 function Header({config,openSearch}:{config:AppConfig;openSearch:()=>void}){return <header className="header"><button className="logo-action" onClick={()=>navigate('discover')}><Logo/></button><div className="header-right"><Notice network={config.network}/><IconButton onClick={openSearch} title="Search"><Search size={19}/></IconButton><OrbitWalletButton/></div></header>}
 function MiniGraph({values}:{values:number[]}){if(values.length<2)return <div className="empty-graph">—</div>;const w=112,h=37,mn=Math.min(...values),mx=Math.max(...values);const span=mx-mn||1;const pts=values.map((v,i)=>`${(i/(values.length-1)*w).toFixed(1)},${(h-4-((v-mn)/span)*(h-8)).toFixed(1)}`).join(' ');return <svg className="mini-graph" viewBox="0 0 112 37" preserveAspectRatio="none" aria-label="Recent price history"><polyline points={pts} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>}
 function CoinAvatar({l,size='small'}:{l:Launch;size?:'small'|'large'}){return <span className={'coin-avatar '+size}>{l.image?<img src={l.image} alt="" loading="lazy"/>:<Coins size={24}/>}<span className="sol-badge">≋</span></span>}
@@ -68,18 +124,45 @@ function Creator({config,notify,onCreated}:{config:AppConfig;notify:(m:string)=>
    notify('Wallet signature test failed. No transaction was sent.');
   }finally{setBusy(false)}
  }
- // ORBIT_STAGE8_RAYDIUM_TEST_UI: builds and signs a real Raydium tx locally without sending it.
- async function testRaydiumSigning(){
+ // ORBIT_STAGE12_READONLY_AUDIT
+ // Inspect a Raydium launch WITHOUT asking Phantom to sign.
+ async function inspectRaydium(){
   if(busy)return;
   setBusy(true);setLaunchError('');
   try{
-   const result=await checkRaydiumLaunchSigning(connection,config,wallet);
-   setLaunchError('Raydium launch signing test: PASSED.\n'+result);
-   notify('Raydium launch signing test passed. No transaction sent.');
+   const report=await inspectRaydiumLaunch(connection,config,wallet);
+   setLaunchError(report.slice(0,6500));
+   notify('Read-only Raydium audit completed. No wallet prompt.');
   }catch(err){
-   const e=err as any;
-   setLaunchError('Raydium launch signing test: FAILED (no transaction sent).\n'+String(e?.name||'Error')+': '+String(e?.message||err));
-   notify('Raydium launch test failed. No transaction sent.');
+   setLaunchError('Read-only Raydium audit failed. No transaction sent.\n'+String((err as Error)?.message||err));
+   notify('Raydium audit failed; no transaction sent.');
+  }finally{setBusy(false)}
+ }
+ // ORBIT_STAGE13_LEGACY_READONLY
+ async function inspectLegacy(){
+  if(busy)return;
+  setBusy(true);setLaunchError('');
+  try{
+   const report=await inspectRaydiumLegacy(connection,config,wallet);
+   setLaunchError(report.slice(0,6500));
+   notify('Legacy comparison finished. No wallet signature requested.');
+  }catch(err){
+   setLaunchError('Legacy read-only comparison failed.\n'+String((err as Error)?.message||err));
+   notify('Legacy comparison failed; no transaction was sent.');
+  }finally{setBusy(false)}
+ }
+ // ORBIT_STAGE14_LEGACY_SIGN_ONLY
+ // This requires an explicit wallet approval but NEVER sends any transaction.
+ async function testLegacySignature(){
+  if(busy)return;
+  setBusy(true);setLaunchError('');
+  try{
+   const report=await testRaydiumLegacySigning(connection,config,wallet);
+   setLaunchError(report);
+   notify('Legacy signing passed; no transaction sent.');
+  }catch(err){
+   setLaunchError('Legacy signing test FAILED (no broadcast).\n'+String((err as Error)?.message||err));
+   notify('Legacy signature not obtained. No transaction sent.');
   }finally{setBusy(false)}
  }
  async function create(e:React.FormEvent){e.preventDefault();if(!wallet.publicKey){notify('Connect your wallet first');return}if(!file){notify('Upload a token image');return}if(!config.launchEnabled){notify(config.launchBlockReason||'Token creation is currently disabled');return}
@@ -124,7 +207,7 @@ function Creator({config,notify,onCreated}:{config:AppConfig;notify:(m:string)=>
  <form onSubmit={create} className="form-layout"><div className="form-main"><div className="panel"><div className="panel-label">Token details</div><p className="micro-note">The token name and ticker cannot be changed after creation.</p><label>Token name <input required maxLength={32} minLength={2} placeholder="Name your coin" value={form.name} onChange={e=>update('name',e.target.value)}/></label><label>Ticker <input required maxLength={10} minLength={2} pattern="[a-zA-Z0-9_]+" placeholder="e.g., ORB" value={form.symbol} onChange={e=>update('symbol',e.target.value)}/></label><label>Description (optional) <textarea maxLength={800} rows={4} placeholder="What is your project about?" value={form.description} onChange={e=>update('description',e.target.value)}/></label><button type="button" className="text-toggle" onClick={()=>setAdvanced(!advanced)}>Add social links <ChevronDown size={15} style={{transform:advanced?'rotate(180deg)':undefined}}/></button>{advanced&&<div className="socials">{(['website','twitter','telegram'] as const).map(k=><label key={k}>{k==='website'?'Website':k==='twitter'?'X / Twitter':'Telegram'} <input type="url" placeholder="https://..." value={form[k]} onChange={e=>update(k,e.target.value)}/></label>)}</div>}<hr/><div className="panel-label">Liquidity asset</div><div className="sol-choice">≋ <strong>SOL</strong> <span>Raydium LaunchLab</span></div><p className="micro-note">The initial quote asset is SOL. The token launches on a bonding curve and may migrate to a Raydium pool when the protocol requirements are met.</p></div>
  <div className="panel"><div className="panel-label">Coin image</div><label className="drop-zone"><input type="file" accept="image/png,image/jpeg,image/gif,image/webp" onChange={e=>onFile(e.target.files?.[0])} hidden/>{imagePreview?<img className="file-preview" src={imagePreview} alt="Token preview"/>:<Upload size={33}/>}<strong>{file?file.name:'Select an image'}</strong><small>PNG, JPG, GIF, WebP · up to 5 MB</small></label></div></div>
  <aside className="form-side"><div className="panel sticky-panel"><div className="panel-label">Launch settings</div><div className="property"><span>Network</span><b>{config.network==='devnet'?'Solana Devnet':'Solana Mainnet'}</b></div><div className="property"><span>Protocol</span><b>Raydium LaunchLab</b></div><div className="property"><span>Type</span><b>Bonding curve</b></div><div className="property"><span>Initial buy</span><b>None</b></div><div className="property"><span>Fee</span><b>Set by the protocol</b></div><div className="property"><span>RPC / Program</span><b>{rpcStatus?(rpcStatus.ready?'Ready for config check': 'Unavailable'):'Not checked'}</b></div><button className="button full" type="button" onClick={checkRpc} disabled={checking}>{checking?'Checking network…':'Check Devnet connection'}</button>{rpcStatus&&<p className={rpcStatus.ready?'micro-note':'warning-text'}>{rpcStatus.reason}{rpcStatus.slot!==null?` · Slot ${rpcStatus.slot}`:''}</p>}<Banner>All network fees and transactions must be approved in your wallet. Private keys are never sent to the app.</Banner>{receipt&&<p className="success-receipt">Created token address: <code>{receipt}</code></p>}{launchError&&<div role="alert" className="warning-text" style={{whiteSpace:'pre-wrap',overflowWrap:'anywhere',margin:'12px 0',fontSize:12}}><strong>Launch diagnostics</strong><br/>{launchError}<p style={{marginTop:10}}>If Phantom requested approval, check your Devnet transaction activity before attempting another launch.</p></div>}{!config.launchEnabled&&<p className="warning-text">{config.launchBlockReason}</p>}
- {wallet.publicKey&&config.network==='devnet'&&<button className="button full" type="button" disabled={busy} onClick={testWalletSignature}>Test wallet signature (no broadcast)</button>}{wallet.publicKey&&config.network==='devnet'&&<button className="button full" type="button" disabled={busy} onClick={testRaydiumSigning}>Test Raydium wallet-first signature (no broadcast)</button>}{wallet.publicKey?<button className="button green-button full" type="submit" disabled={busy||!config.launchEnabled}>{busy?<><LoaderCircle className="spin" size={18}/> Approve in your wallet…</>:<><Rocket size={17}/> Create token on Solana</>}</button>:<div className="center-wallet"><OrbitWalletButton showHint/></div>}
+ {wallet.publicKey&&config.network==='devnet'&&<button className="button full" type="button" disabled={busy} onClick={testWalletSignature}>Test wallet signature (no broadcast)</button>}{wallet.publicKey&&config.network==='devnet'&&<button className="button full" type="button" disabled={busy} onClick={inspectRaydium}>Inspect Raydium launch (read-only; no wallet prompt)</button>}{wallet.publicKey&&config.network==='devnet'&&<button className="button full" type="button" disabled={busy} onClick={inspectLegacy}>Inspect LEGACY launch (read-only; no wallet prompt)</button>}{wallet.publicKey&&config.network==='devnet'&&<button className="button full" type="button" disabled={busy} onClick={testLegacySignature}>Test LEGACY wallet signature (no broadcast)</button>}{wallet.publicKey?<button className="button green-button full" type="submit" disabled={busy||!config.launchEnabled}>{busy?<><LoaderCircle className="spin" size={18}/> Approve in your wallet…</>:<><Rocket size={17}/> Create token on Solana</>}</button>:<div className="center-wallet"><OrbitWalletButton showHint/></div>}
  </div></aside></form></div>;
 }
 function TokenDetails({item,config,pool,graph,notify}:{item?:Launch;config:AppConfig;pool?:PoolView;graph:number[];notify:(m:string)=>void}){
@@ -145,7 +228,6 @@ function TokenDetails({item,config,pool,graph,notify}:{item?:Launch;config:AppCo
  <Banner>Prices can change quickly. Buys and sells submit real transactions. Fees, slippage and network costs depend on execution conditions.</Banner><button className={'button full '+(side==='buy'?'green-button':'red-button')} onClick={trade} disabled={busy||!wallet.publicKey||!routeEnabled||config.network==='mainnet-beta'&&!config.mainnetTradingEnabled}>{busy?<><LoaderCircle className="spin"/> Approve in wallet…</>:`${side==='buy'?'Buy':'Sell'} ${display.symbol}`}</button>{!wallet.publicKey&&<div className="center-wallet"><OrbitWalletButton showHint/></div>}{sig&&<a className="tx-link" href={explorer(sig)} rel="noreferrer" target="_blank"><CheckCircle2 size={15}/> View transaction <ExternalLink size={14}/></a>}</aside></div></div>;
 }
 function Profile({items,config,notify}:{items:Launch[];config:AppConfig;notify:(m:string)=>void}){const {publicKey}=useWallet();const wallet=publicKey?.toBase58();const myItems=items.filter(i=>i.creator===wallet);return <div><div className="page-heading"><small className="eyebrow">ACCOUNT</small><h1>My profile</h1></div>{wallet?<><div className="profile-banner"><Wallet size={24}/><div><b>{shorten(wallet,9)}</b><small>Connected wallet · {config.network}</small></div><IconButton title="Copy address" onClick={()=>{navigator.clipboard.writeText(wallet);notify('Address copied')}}><Copy size={17}/></IconButton></div><h2 className="section-heading">My launches <span>{myItems.length}</span></h2>{myItems.length?<div className="profile-list">{myItems.map(l=><button key={l.mint} className="profile-item" onClick={()=>navigate('token',l.mint)}><CoinAvatar l={l}/><span><strong>{l.name}</strong><small>${l.symbol} · {ago(l.createdAt)}</small></span><ArrowUpRight size={18}/></button>)}</div>:<Empty icon={<Rocket/>} heading="No tokens yet" body="Tokens launched by your wallet through this Orbit instance will appear here." action={<button className="button green-button" onClick={()=>navigate('create')}>Create token</button>}/>}</>:<Empty icon={<Wallet/>} heading="Connect wallet" body="Connect a wallet to see the tokens created by its public address." action={<OrbitWalletButton showHint/>}/>}</div>}
-function MenuPage(){const nav=[{page:'discover' as Page,text:'Explore tokens',icon:<Compass/>},{page:'leaderboard' as Page,text:'Leaderboard',icon:<Trophy/>},{page:'live' as Page,text:'Live',icon:<Radio/>},{page:'rewards' as Page,text:'Rewards',icon:<Coins/>},{page:'create' as Page,text:'Create token',icon:<Plus/>}];return <div className="menu-page"><div className="page-heading"><small className="eyebrow">ORBIT</small><h1>Menu</h1></div><div className="menu-links">{nav.map(n=><button key={n.page} onClick={()=>navigate(n.page)}>{n.icon}{n.text}<ArrowUpRight size={16}/></button>)}</div></div>}
 function Footer(){return <footer className="footer"><div><b>ORBIT</b><p>Independent interface · Solana launch infrastructure</p></div><div><span>RESOURCES</span><a href="https://solana.com/docs" target="_blank" rel="noreferrer">Solana documentation</a><a href="https://docs.raydium.io/" target="_blank" rel="noreferrer">Raydium LaunchLab</a><a href="https://developers.jup.ag/" target="_blank" rel="noreferrer">Jupiter API</a></div><div><span>INFORMATION</span><p>No returns are guaranteed. Independent security and legal reviews, plus durable metadata storage, are required before a mainnet launch.</p></div><small>© Orbit · Test build · Not affiliated with pump.fun</small></footer>}
 function Shell({config}:{config:AppConfig}){
  const [route,setRoute]=useState(getInitialRoute());const [items,setItems]=useState<Launch[]>([]);const [market,setMarket]=useState<Record<string,PoolView>>({});const [history,setHistory]=useState<Record<string,number[]>>({});const [message,setMessage]=useState('');const [search,setSearch]=useState(false);const [query,setQuery]=useState('');
@@ -171,9 +253,9 @@ function Shell({config}:{config:AppConfig}){
  {route.page==='home'&&<><div className="hero"><div><small className="eyebrow green">SOLANA · TOKEN LAUNCHPAD</small><h1>Create a token.<br/><em>Launch an idea.</em></h1><p>Launch tokens through Raydium on-chain programs. Transparent transactions, self-custodial wallets, and real on-chain data.</p><button className="button green-button" onClick={()=>navigate('create')}>Create token <ArrowUpRight size={17}/></button></div><div className="hero-planet"><span>O</span><i/></div></div><h2 className="section-heading">New launches <button onClick={()=>navigate('discover')}>View all <ArrowUpRight size={15}/></button></h2>{items.length?<Cards items={items.slice(0,6)} market={market} graph={history} mode="grid" open={m=>navigate('token',m)}/>:<Empty icon={<Rocket/>} heading="Waiting for the first launch" body="Real tokens will appear here once their transactions are confirmed and registered."/>}</>}
  {route.page==='create'&&<Creator config={config} notify={notify} onCreated={load}/>}
  {route.page==='portfolio'&&<Profile items={items} config={config} notify={notify}/>}
- {route.page==='menu'&&<MenuPage/>}
+ 
  {route.page==='leaderboard'&&<Browse title="Leaderboard" tagline="LEADERBOARD / BONDING CURVE" config={config} items={[...items].sort((a,b)=>(market[b.mint]?.progress||0)-(market[a.mint]?.progress||0))} market={market} graph={history} notify={notify}/>}
- {route.page==='live'&&<><div className="page-heading"><small className="eyebrow">LIVE</small><h1>Live streams</h1></div><Empty icon={<Radio size={28}/>} heading="Live streaming is not available yet" body="Actual live streams require WebRTC infrastructure, moderation, reports, and recording storage. This page does not simulate a live broadcast."/></>}
+ {route.page==='live'&&<OrbitLive directRoom={route.mint}/>}
  {route.page==='rewards'&&<><div className="page-heading"><small className="eyebrow">REWARDS</small><h1>Rewards</h1></div><Empty icon={<Trophy size={28}/>} heading="Module not available yet" body="Rewards and payouts require a separately audited contract. No simulated balances or rewards are shown."/></>}
  {route.page==='token'&&<TokenDetails key={route.mint} item={active} config={config} pool={market[route.mint]} graph={history[route.mint]||[]} notify={notify}/>}
  </main><Footer/><Nav page={route.page}/>{search&&<div className="search-layer" role="dialog" aria-label="Search"><div className="search-box"><div className="search-head"><Search size={20}/><input autoFocus placeholder="Search by name, ticker, or mint" value={query} onChange={e=>setQuery(e.target.value)}/><IconButton title="Close" onClick={()=>{setSearch(false);setQuery('')}}><X size={19}/></IconButton></div><div className="search-results">{visible.slice(0,15).map(l=><button key={l.mint} onClick={()=>{setSearch(false);setQuery('');navigate('token',l.mint)}}><CoinAvatar l={l}/><span><b>{l.name}</b><small>${l.symbol} · {shorten(l.mint)}</small></span><ArrowUpRight size={16}/></button>)}{!visible.length&&<p>No results</p>}</div></div><button className="search-overlay" onClick={()=>setSearch(false)} aria-label="Close"/></div>}{message&&<Toast message={message} onClose={()=>setMessage('')}/>}</>;

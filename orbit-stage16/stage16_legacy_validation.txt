@@ -1,0 +1,61 @@
+ const actual=signed.serializeMessage();
+ // ORBIT_STAGE16_PHANTOM_COMPUTE_BUDGET_VERIFY
+ // Phantom documents automatic priority-fee enhancement on unsigned dApp
+ // transactions. It may prepend two ComputeBudget instructions while signing.
+ // Compare the original Raydium instruction AFTER stripping exactly these two
+ // extras. Never accept another program, account, data, payer, or hash change.
+ let phantomPriorityNote='Wallet returned the original Raydium message unchanged.';
+ if(actual.length!==expected.length||actual.some((v,i)=>v!==expected[i])){
+  const computeBudget='ComputeBudget111111111111111111111111111111';
+  const afterInstructions=signed.instructions.map(ix=>({
+   program:ix.programId.toBase58(),
+   accounts:ix.keys.map(k=>k.pubkey.toBase58()+':'+(k.isSigner?'s':'-')+(k.isWritable?'w':'-')).join('|'),
+   data:Array.from(ix.data).join(',')
+  }));
+  const prefixCount=afterInstructions.length-beforeInstructions.length;
+  const extra=signed.instructions.slice(0,Math.max(prefixCount,0));
+  const tail=afterInstructions.slice(Math.max(prefixCount,0));
+  const originalRaydiumUnchanged=tail.length===beforeInstructions.length&&
+   tail.every((ix,i)=>ix.program===beforeInstructions[i].program&&
+    ix.accounts===beforeInstructions[i].accounts&&
+    ix.data===beforeInstructions[i].data);
+  const samePayer=beforePayer===(signed.feePayer?.toBase58()||'');
+  const sameHash=beforeBlockhash===(signed.recentBlockhash||'');
+  let cuLimit:number|null=null;
+  let cuPrice:bigint|null=null;
+  let computeOnly=prefixCount===2;
+  for(const ix of extra){
+   if(!ix.programId.toBase58 || ix.programId.toBase58()!==computeBudget||ix.keys.length!==0){
+    computeOnly=false;continue;
+   }
+   const d=ix.data;
+   if(d.length===5&&d[0]===2&&cuLimit===null){
+    cuLimit=(d[1]|d[2]<<8|d[3]<<16|d[4]<<24)>>>0;
+   }else if(d.length===9&&d[0]===3&&cuPrice===null){
+    cuPrice=0n;
+    for(let i=8;i>=1;i--)cuPrice=(cuPrice<<8n)+BigInt(d[i]);
+   }else computeOnly=false;
+  }
+  // These bounds apply only to this local signing diagnostic. No SOL is spent.
+  const allowedBudget=computeOnly&&cuLimit!==null&&cuPrice!==null&&
+   cuLimit>=110_000&&cuLimit<=400_000&&cuPrice<=1_000_000n&&
+   (BigInt(cuLimit)*cuPrice+999_999n)/1_000_000n<=1_000_000n;
+  if(!samePayer||!sameHash||!originalRaydiumUnchanged||!allowedBudget){
+   throw new Error('Stage 16: unexpected wallet changes; NO broadcast. '+
+    'Payer unchanged='+samePayer+', blockhash unchanged='+sameHash+
+    ', Raydium instruction (program/accounts/data) unchanged='+originalRaydiumUnchanged+
+    ', two recognized bounded ComputeBudget instructions='+allowedBudget+
+    '. Before/after instruction count='+beforeInstructions.length+'/'+afterInstructions.length+
+    '. Do not bypass any wallet security warning.');
+  }
+  if(cuLimit===null||cuPrice===null)throw new Error('Stage 16: missing ComputeBudget values.');
+  const changedMessage=signed.compileMessage();
+  const returnedSigners=changedMessage.accountKeys.slice(0,changedMessage.header.numRequiredSignatures);
+  if(returnedSigners.length!==2||!returnedSigners[0].equals(payer)||!returnedSigners[1].equals(mint.publicKey))
+   throw new Error('Stage 16: transaction signer accounts changed; NO broadcast.');
+  phantomPriorityNote='Phantom inserted exactly two bounded ComputeBudget instructions before an IDENTICAL Raydium instruction. '+
+   'CU limit='+cuLimit+'; CU price='+cuPrice+' micro-lamports/CU; '+
+   'estimated priority fee='+Number((BigInt(cuLimit)*cuPrice+999_999n)/1_000_000n)/1e9+' SOL. '+
+   'Fee payer, blockhash, Raydium accounts and data are unchanged.';
+ }
+ const walletSig=signed.signatures.find(s=>s.publicKey.equals(payer))?.signature;

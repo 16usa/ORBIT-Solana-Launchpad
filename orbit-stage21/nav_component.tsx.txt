@@ -1,0 +1,55 @@
+// ORBIT_STAGE21_MENU_POPUP: the three-dot navigation opens a popover instead of a page.
+function Nav({page}:{page:Page}){
+  const [open,setOpen]=useState(false);
+  const anchor=React.useRef<HTMLDivElement|null>(null);
+  const links:{page:Page;title:string;icon:React.ReactNode}[]=[
+    {page:'discover',title:'Explore tokens',icon:<Compass/>},
+    {page:'leaderboard',title:'Leaderboard',icon:<Trophy/>},
+    {page:'live',title:'Live',icon:<Radio/>},
+    {page:'rewards',title:'Rewards',icon:<Coins/>},
+    {page:'create',title:'Create token',icon:<Plus/>},
+  ];
+  useEffect(()=>{
+    if(!open)return;
+    const onOutside=(event:PointerEvent)=>{
+      if(anchor.current&&!anchor.current.contains(event.target as Node))setOpen(false);
+    };
+    const onKey=(event:KeyboardEvent)=>{
+      if(event.key==='Escape'){
+        setOpen(false);
+        anchor.current?.querySelector<HTMLButtonElement>('.orbit-menu-trigger')?.focus();
+      }
+    };
+    const onRoute=()=>setOpen(false);
+    document.addEventListener('pointerdown',onOutside);
+    document.addEventListener('keydown',onKey);
+    window.addEventListener('hashchange',onRoute);
+    return ()=>{
+      document.removeEventListener('pointerdown',onOutside);
+      document.removeEventListener('keydown',onKey);
+      window.removeEventListener('hashchange',onRoute);
+    };
+  },[open]);
+  const secondaryActive=page==='leaderboard'||page==='live'||page==='rewards';
+  return <nav className="bottom-nav" aria-label="Primary navigation">
+    {allNav.map(n=>n.page==='menu'?
+      <div className="orbit-menu-anchor" ref={anchor} key="menu">
+        <button type="button" className={'orbit-menu-trigger '+(open||secondaryActive?'active':'')}
+          aria-label="More options" aria-haspopup="menu" aria-expanded={open}
+          aria-controls={open?'orbit-more-menu':undefined} title="More options"
+          onClick={()=>setOpen(value=>!value)}>
+          <MoreHorizontal/><span>Menu</span>
+        </button>
+        {open&&<div className="orbit-more-popup" id="orbit-more-menu" role="menu" aria-label="More options">
+          {links.map(link=><button type="button" role="menuitem" key={link.page}
+            onClick={()=>{setOpen(false);navigate(link.page)}}>
+            {link.icon}<span>{link.title}</span>
+          </button>)}
+        </div>}
+      </div>
+    :<button type="button" key={n.page} className={page===n.page?'active':''}
+      title={n.title} onClick={()=>{setOpen(false);navigate(n.page)}}>
+      {n.icon}<span>{n.title}</span>
+    </button>)}
+  </nav>;
+}

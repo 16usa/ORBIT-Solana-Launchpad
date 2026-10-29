@@ -8,3 +8,73 @@
 .orbit-wallet-action .orbit-phantom-link{display:inline-flex!important;align-items:center;justify-content:center;text-decoration:none!important;white-space:nowrap}
 .orbit-wallet-hint{font-size:12px;line-height:1.5;color:#a8abb2;max-width:370px;margin:4px auto 10px;text-align:center}
 @media(max-width:600px){.header .orbit-wallet-action .orbit-phantom-link{font-size:11px!important;padding:0 9px!important}}
+
+/* ORBIT_STAGE20_WALLET_AVATAR: a compact, circular connected-wallet control */
+.orbit-account-menu { position:relative; display:inline-flex; align-items:center; flex-shrink:0; }
+.orbit-account-avatar-trigger { width:43px; height:43px; border:1px solid #424750; background:#20232a; padding:0; border-radius:50%; color:var(--mint); display:flex; align-items:center; justify-content:center; overflow:hidden; flex-shrink:0; }
+.orbit-account-avatar-trigger:hover { border-color:var(--mint); }
+.orbit-account-avatar-trigger:focus-visible { outline:2px solid var(--mint); outline-offset:3px; }
+.orbit-account-avatar-image { width:100%; height:100%; border-radius:50%; object-fit:cover; display:block; }
+.orbit-account-wallet-icon { width:26px; height:26px; object-fit:contain; display:block; }
+.orbit-account-avatar-fallback { font-size:27px; line-height:1; }
+.orbit-account-dropdown { position:absolute; top:calc(100% + 10px); right:0; width:220px; max-width:calc(100vw - 24px); padding:6px; z-index:120; border-radius:12px; border:1px solid #34373d; background:#22242a; box-shadow:0 15px 40px rgba(0,0,0,.4); color:#fff; }
+.orbit-account-dropdown-address { font-size:12px; color:#aaaeb8; padding:9px 12px 10px; border-bottom:1px solid #383b41; margin-bottom:4px; white-space:nowrap; }
+.orbit-account-dropdown button { width:100%; text-align:left; border:0; background:transparent; color:#f4f5f6; border-radius:7px; font-size:13px; font-weight:650; padding:12px; display:block; }
+.orbit-account-dropdown button:hover,.orbit-account-dropdown button:focus-visible { background:#373a42; }
+.orbit-account-avatar-upload { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; clip-path:inset(50%); overflow:hidden; }
+.orbit-account-avatar-notice { position:absolute; top:calc(100% + 10px); right:0; background:#24352c; color:#d9ffe8; border:1px solid #497b5b; font-size:11px; white-space:nowrap; padding:7px 10px; border-radius:7px; z-index:110; max-width:220px; }
+@media (max-width: 520px) { .orbit-account-avatar-trigger { width:42px; height:42px; } .header-right:has(.orbit-account-menu) { gap:10px; } }
+
+/* ORBIT_STAGE21_MENU_POPUP — compact, floating three-dot menu, no page navigation */
+.bottom-nav .orbit-menu-anchor{
+  position:relative;display:flex;align-items:center;justify-content:center;
+  flex:1;min-width:0;height:100%;overflow:visible;
+}
+.bottom-nav .orbit-menu-anchor>.orbit-menu-trigger{
+  width:100%;height:100%;flex:1;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:3px;border:0;
+  padding:0;background:none;color:inherit;
+}
+.bottom-nav .orbit-menu-anchor>.orbit-menu-trigger.active{color:var(--mint)}
+.bottom-nav .orbit-more-popup{
+  position:absolute;right:8px;bottom:calc(100% + 13px);
+  width:265px;max-width:calc(100vw - 24px);
+  display:flex;flex-direction:column;gap:3px;
+  padding:11px;background:linear-gradient(136deg,#242a29 0%,#1d2125 54%,#15181c 100%);
+  border:1px solid #393f42;border-radius:17px;
+  box-shadow:0 17px 48px rgba(0,0,0,.68);
+  backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  z-index:60;
+}
+.bottom-nav .orbit-more-popup::after{
+  content:"";position:absolute;bottom:-6px;right:24px;width:10px;height:10px;
+  background:#171a1e;border-right:1px solid #393f42;border-bottom:1px solid #393f42;
+  transform:rotate(45deg);
+}
+.bottom-nav .orbit-more-popup button{
+  display:flex;flex:0 0 auto;flex-direction:row;align-items:center;
+  justify-content:flex-start;gap:15px;
+  width:100%;height:auto;min-height:49px;padding:11px 12px;
+  color:#eeeff1;background:transparent;border:0;border-radius:10px;
+  font-size:15px;font-weight:560;text-align:left;letter-spacing:-.015em;
+}
+.bottom-nav .orbit-more-popup button:hover,
+.bottom-nav .orbit-more-popup button:focus-visible{
+  color:var(--mint);background:#ffffff12;
+}
+.bottom-nav .orbit-more-popup button svg{
+  width:21px;height:21px;stroke-width:1.8;flex-shrink:0;
+}
+.bottom-nav .orbit-more-popup button span{
+  display:inline;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:inherit;
+}
+@media(min-width:1000px){
+  .bottom-nav .orbit-menu-anchor{flex:0 0 120px;}
+}
+@media(max-width:380px){
+  .bottom-nav .orbit-more-popup{width:240px;}
+  .bottom-nav .orbit-more-popup button{font-size:14px;min-height:46px;}
+}
+@media(prefers-reduced-motion:reduce){
+  .bottom-nav .orbit-more-popup{scroll-behavior:auto;}
+}

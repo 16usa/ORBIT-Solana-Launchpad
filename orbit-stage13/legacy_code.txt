@@ -1,0 +1,93 @@
+// ORBIT_STAGE13_LEGACY_READONLY
+// Build a Raydium LaunchLab *legacy* transaction to test whether a V0 ALT
+// is the reason Phantom cannot inspect our Devnet creation transaction.
+// Does not request any signature, broadcast, upload, or create a token.
+export async function inspectRaydiumLegacy(
+ connection:Connection,config:AppConfig,wallet:WalletContextState
+):Promise<string>{
+ if(config.network!=='devnet'||!config.launchEnabled)
+  throw new Error('Legacy comparison is enabled for Solana Devnet only.');
+ if(!wallet.publicKey)throw new Error('Connect a dedicated Devnet wallet to inspect the transaction.');
+ const payer=wallet.publicKey;
+ const platformId=await requireLaunchPlatform(connection,config,payer);
+ const {configId,configInfo}=await verifyLaunchConfig(connection,config);
+ const raydium=await sdk(connection,config,wallet);
+ const mint=Keypair.generate();
+ const quote=await raydium.token.getTokenInfo(configInfo.mintB);
+ let built:any;
+ try{
+  built=await raydium.launchpad.createLaunchpad({
+   programId:program(config),mintA:mint.publicKey,
+   name:'ORBIT Legacy Audit',symbol:'ORBLEG',
+   uri:'https://example.com/orbit-legacy-audit-never-published.json',
+   decimals:6,migrateType:'cpmm',configId,configInfo,
+   mintBDecimals:quote.decimals,createOnly:true,
+   buyAmount:new BN(1000),slippage:new BN(100),
+   extraSigners:[mint],txVersion:TxVersion.LEGACY,platformId
+  } as any);
+ }catch(e){
+  return 'ORBIT Stage 13 - LEGACY read-only comparison\n'+
+   'Legacy Raydium SDK build: FAILED. '+String((e as Error)?.message||e)+
+   '\nNo transaction sent, no signature requested. Do not use Create Token.';
+ }
+ if(!Array.isArray(built.transactions)||built.transactions.length!==1)
+  return 'ORBIT Stage 13 - LEGACY read-only comparison\n'+
+   'Expected 1 legacy transaction, SDK built '+String(built.transactions?.length??'none')+
+   '. This variant is not supported by the current one-transaction ORBIT launch. No signature or broadcast.';
+ const original=built.transactions[0];
+ if(!(original instanceof Transaction))
+  throw new Error('Raydium returned a non-legacy transaction while LEGACY was requested.');
+ if(original.feePayer&&!original.feePayer.equals(payer))
+  throw new Error('Legacy builder fee payer differs from the connected Devnet wallet.');
+ const bh=await connection.getLatestBlockhash('confirmed');
+ // Reconstruct only the *instructions*; SDK signatures are intentionally discarded.
+ const tx=new Transaction({feePayer:payer,recentBlockhash:bh.blockhash});
+ tx.add(...original.instructions);
+ const msg=tx.compileMessage();
+ const signers=msg.accountKeys.slice(0,msg.header.numRequiredSignatures);
+ if(signers.length!==2||!signers[0].equals(payer)||!signers[1].equals(mint.publicKey))
+  throw new Error('Unexpected legacy transaction signers. Nothing was signed or submitted.');
+ const called=[...new Set(tx.instructions.map(ix=>ix.programId.toBase58()))];
+ const allowed=new Set([
+  program(config).toBase58(),SystemProgram.programId.toBase58(),
+  TOKEN_PROGRAM_ID.toBase58(),
+  'TokenzQdBNbLqP5VEhdkAS6EPFZ6LKruL4y3Yz9KP',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+  'ComputeBudget111111111111111111111111111111',
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'
+ ]);
+ const unknown=called.filter(id=>!allowed.has(id));
+ if(unknown.length||!called.includes(program(config).toBase58()))
+  throw new Error('Unknown/missing top-level program(s): '+unknown.join(', ')+'; no transaction submitted.');
+ let bytes:number;
+ try{bytes=tx.serialize({requireAllSignatures:false,verifySignatures:false}).length}
+ catch(e){
+  return 'ORBIT Stage 13 - LEGACY read-only comparison\n'+
+   'Legacy transaction could not serialize: '+String((e as Error)?.message||e)+
+   '\nNo wallet prompt or broadcast.';
+ }
+ if(bytes>1232)
+  return 'ORBIT Stage 13 - LEGACY read-only comparison\n'+
+   'Legacy transaction TOO LARGE: '+bytes+' bytes (max 1232). Do not switch the live launch to legacy. No wallet prompt or broadcast.';
+ const fee=await connection.getFeeForMessage(msg,'confirmed');
+ // Legacy web3.js overload: no second arg => unsigned simulation, no broadcast.
+ const sim=await connection.simulateTransaction(tx);
+ const status=sim.value.err?'FAILED '+JSON.stringify(sim.value.err):'PASSED (unsigned only)';
+ return [
+  'ORBIT Stage 13 - LEGACY read-only comparison',
+  'No wallet signature requested. No transaction sent. No token created.',
+  'Temporary mint and dummy metadata URI, not a production token.',
+  'Format: LEGACY (no address lookup tables)',
+  'Serialized bytes: '+bytes+' / 1232',
+  'Instructions: '+tx.instructions.length+'; required signers: '+signers.length,
+  'Fee: '+(fee.value===null?'unavailable':(fee.value/1e9).toFixed(9)+' SOL'),
+  'Top-level programs: '+called.join(', '),
+  'RPC simulation slot: '+sim.context.slot,
+  'RPC simulation: '+status,
+  'Units consumed: '+String(sim.value.unitsConsumed??'unavailable'),
+  'Last logs:\n'+(sim.value.logs||[]).slice(-8).join('\n'),
+  'This checks whether legacy formatting is feasible; it does NOT prove Phantom will approve a real launch.'
+ ].join('\n');
+}
+

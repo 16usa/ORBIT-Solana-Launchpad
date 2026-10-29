@@ -1,0 +1,102 @@
+// ORBIT_STAGE14_LEGACY_SIGN_ONLY
+// Compare the wallet-signing path for LEGACY Raydium LaunchLab transactions.
+// This diagnostic NEVER broadcasts, registers, uploads metadata, or launches a token.
+// Use a separate test-only Phantom account. Never override a wallet security warning.
+export async function testRaydiumLegacySigning(
+ connection:Connection,config:AppConfig,wallet:WalletContextState
+):Promise<string>{
+ if(config.network!=='devnet'||!config.launchEnabled)
+  throw new Error('Legacy signature test is available on Devnet only.');
+ if(!wallet.publicKey||!wallet.signTransaction)
+  throw new Error('Connect a Devnet wallet that supports signTransaction.');
+ const payer=wallet.publicKey;
+ const versions=wallet.wallet?.adapter?.supportedTransactionVersions;
+ if(versions&&!versions.has('legacy'))
+  throw new Error('This wallet adapter does not support legacy Solana transactions.');
+ const platformId=await requireLaunchPlatform(connection,config,payer);
+ const {configId,configInfo}=await verifyLaunchConfig(connection,config);
+ const raydium=await sdk(connection,config,wallet);
+ const mint=Keypair.generate();
+ const quote=await raydium.token.getTokenInfo(configInfo.mintB);
+ const built=await raydium.launchpad.createLaunchpad({
+  programId:program(config),mintA:mint.publicKey,
+  name:'ORBIT Legacy Sign Test',symbol:'ORBTST',
+  uri:'https://example.com/orbit-legacy-sign-test-never-published.json',
+  decimals:6,migrateType:'cpmm',configId,configInfo,
+  mintBDecimals:quote.decimals,createOnly:true,
+  buyAmount:new BN(1000),slippage:new BN(100),
+  extraSigners:[mint],txVersion:TxVersion.LEGACY,platformId
+ } as any);
+ if(!Array.isArray(built.transactions)||built.transactions.length!==1)
+  throw new Error('Expected one legacy launch transaction; diagnostic aborted.');
+ const source=built.transactions[0];
+ if(!(source instanceof Transaction))
+  throw new Error('Raydium did not build a LEGACY transaction.');
+ if(source.feePayer&&!source.feePayer.equals(payer))
+  throw new Error('Transaction fee payer differs from the connected wallet.');
+ // Rebuild from known Raydium instructions with a fresh Devnet blockhash.
+ // SDK-provided signatures are not forwarded to Phantom.
+ const latest=await connection.getLatestBlockhash('confirmed');
+ const tx=new Transaction({feePayer:payer,recentBlockhash:latest.blockhash});
+ tx.add(...source.instructions);
+ const msg=tx.compileMessage();
+ const signers=msg.accountKeys.slice(0,msg.header.numRequiredSignatures);
+ if(signers.length!==2||!signers[0].equals(payer)||!signers[1].equals(mint.publicKey))
+  throw new Error('Unexpected signer layout; no wallet request made.');
+ const invoked=tx.instructions.map(ix=>ix.programId.toBase58());
+ const allow=new Set([
+  program(config).toBase58(),SystemProgram.programId.toBase58(),
+  TOKEN_PROGRAM_ID.toBase58(),
+  'TokenzQdBNbLqP5VEhdkAS6EPFZ6LKruL4y3Yz9KP',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+  'ComputeBudget111111111111111111111111111111',
+  'metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s',
+  'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr'
+ ]);
+ if(!invoked.includes(program(config).toBase58())||invoked.some(x=>!allow.has(x)))
+  throw new Error('Unrecognized program in legacy transaction; no wallet request made.');
+ const bytes=tx.serialize({requireAllSignatures:false,verifySignatures:false}).length;
+ if(bytes>1232)throw new Error('Legacy transaction exceeds Solana packet size limit.');
+ // Explicit unsigned execution preflight; does not prove a wallet will sign.
+ const simulated=await connection.simulateTransaction(tx);
+ if(simulated.value.err)
+  throw new Error('Legacy preflight failed: '+JSON.stringify(simulated.value.err)+' | '+
+   (simulated.value.logs||[]).slice(-10).join(' | '));
+ const expected=tx.serializeMessage();
+ let signed:Transaction;
+ try{
+  signed=await wallet.signTransaction(tx) as Transaction;
+ }catch(error){
+  throw new Error('Phantom declined the LEGACY launch signature (no broadcast). '+
+   String((error as Error)?.message||error)+
+   '. Do not bypass any security warning.');
+ }
+ if(!(signed instanceof Transaction))
+  throw new Error('Wallet returned an unexpected transaction type.');
+ const actual=signed.serializeMessage();
+ if(actual.length!==expected.length||actual.some((v,i)=>v!==expected[i]))
+  throw new Error('Wallet altered the transaction message; diagnostic aborted.');
+ const walletSig=signed.signatures.find(s=>s.publicKey.equals(payer))?.signature;
+ if(!walletSig||walletSig.length!==64||!walletSig.some(v=>v!==0))
+  throw new Error('Phantom did not return a valid-format payer signature.');
+ if(!signed.verifySignatures(false))
+  throw new Error('Wallet signature failed local cryptographic verification.');
+ // Adding the temporary mint signature AFTER wallet approval must preserve it.
+ const payerSig=new Uint8Array(walletSig);
+ signed.partialSign(mint);
+ const newPayerSig=signed.signatures.find(s=>s.publicKey.equals(payer))?.signature;
+ if(!newPayerSig||newPayerSig.some((v,i)=>v!==payerSig[i]))
+  throw new Error('Mint co-signing unexpectedly changed the wallet signature.');
+ if(!signed.verifySignatures(true))
+  throw new Error('The fully signed legacy transaction failed local verification.');
+ const finalSize=signed.serialize().length;
+ if(finalSize>1232)throw new Error('Signed legacy transaction is oversized.');
+ // CRITICAL: no sendTransaction / sendRawTransaction / execute / postJson here.
+ return 'ORBIT Stage 14 - LEGACY SIGNATURE TEST: PASSED\n'+
+  'Wallet signed the Raydium legacy transaction. Temporary mint co-signed locally.\n'+
+  'Required signers: 2; transaction bytes: '+finalSize+'.\n'+
+  'RPC unsigned execution preflight: PASSED. Both local signatures: VERIFIED.\n'+
+  'NO transaction broadcast. NO token created. NO SOL spent.\n'+
+  'This does not authorize or enable a real launch. Do not ignore future Phantom warnings.';
+}
+
