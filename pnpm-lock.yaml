@@ -193,6 +193,9 @@ importers:
       express:
         specifier: ^5.3.0
         version: 5.3.0
+      livekit-server-sdk:
+        specifier: ^2.19.1
+        version: 2.19.2
       pino:
         specifier: ^9.14.0
         version: 9.14.0
