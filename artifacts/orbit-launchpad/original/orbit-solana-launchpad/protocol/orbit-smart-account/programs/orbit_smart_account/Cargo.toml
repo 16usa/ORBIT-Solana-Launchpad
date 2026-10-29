@@ -1,0 +1,18 @@
+[package]
+name = "orbit_smart_account"
+version = "0.1.0"
+edition = "2021"
+description = "ORBIT Devnet smart account prototype; NOT for production"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "orbit_smart_account"
+
+[features]
+default = []
+no-entrypoint = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = "0.31.1"

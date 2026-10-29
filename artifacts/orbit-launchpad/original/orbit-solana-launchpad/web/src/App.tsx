@@ -5,7 +5,7 @@ import {Rocket,Search,Plus,Home,Compass,UserRound,MoreHorizontal,ArrowUpRight,Ch
 import {AppConfig,Launch,NetworkStatus,callApi,postJson,shorten,ago} from './api';
 import {PoolView,getPool,verifyLaunchConfig,launchToken,curveTrade,migratedTrade,requireLaunchPlatform,checkWalletSigning,inspectRaydiumLaunch,inspectRaydiumLegacy,testRaydiumLegacySigning} from './chain';
 import WalletSetup from './WalletProvider';
-import {PrivyBoundary,OptionalPrivyLogin} from './PrivySession'; // ORBIT_STAGE25_PRIVY
+import {PrivyBoundary,OptionalPrivyLogin,OptionalPrivyAccount} from './PrivySession'; // ORBIT_STAGE25_PRIVY
 import './styles.css';
 import OrbitLive from './OrbitLive';
 
@@ -75,7 +75,7 @@ function Nav({page}:{page:Page}){
   </nav>;
 }
 
-function Header({config,openSearch}:{config:AppConfig;openSearch:()=>void}){return <header className="header"><button className="logo-action" onClick={()=>navigate('discover')}><Logo/></button><div className="header-right"><Notice network={config.network}/><IconButton onClick={openSearch} title="Search"><Search size={19}/></IconButton><OptionalPrivyLogin/><OrbitWalletButton/></div></header>}
+function Header({config,openSearch}:{config:AppConfig;openSearch:()=>void}){return <header className="header"><button className="logo-action" onClick={()=>navigate('discover')}><Logo/></button><div className="header-right"><Notice network={config.network}/><IconButton onClick={openSearch} title="Search"><Search size={19}/></IconButton><OptionalPrivyLogin/></div></header>}
 function MiniGraph({values}:{values:number[]}){if(values.length<2)return <div className="empty-graph">—</div>;const w=112,h=37,mn=Math.min(...values),mx=Math.max(...values);const span=mx-mn||1;const pts=values.map((v,i)=>`${(i/(values.length-1)*w).toFixed(1)},${(h-4-((v-mn)/span)*(h-8)).toFixed(1)}`).join(' ');return <svg className="mini-graph" viewBox="0 0 112 37" preserveAspectRatio="none" aria-label="Recent price history"><polyline points={pts} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>}
 function CoinAvatar({l,size='small'}:{l:Launch;size?:'small'|'large'}){return <span className={'coin-avatar '+size}>{l.image?<img src={l.image} alt="" loading="lazy"/>:<Coins size={24}/>}<span className="sol-badge">≋</span></span>}
 function PoolStamp({pool}:{pool?:PoolView}){if(!pool)return <span className="subdued">No data</span>;return <span className="price">{pool.priceSol>0?pool.priceSol.toExponential(3):'—'} <span>SOL</span></span>}
