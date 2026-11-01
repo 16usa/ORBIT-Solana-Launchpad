@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 
 // Replace with the actual deployed program ID before building/deploying.
-declare_id!("11111111111111111111111111111111");
+declare_id!("BJ4SZSgYumAky5HF9X2vs9ScuvL3biyPhiYMDvVKaSz2");
 
 #[program]
 pub mod orbit_smart_account {
